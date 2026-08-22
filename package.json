@@ -1,0 +1,30 @@
+{
+  "name": "mcp-svstudio",
+  "version": "1.0.0",
+  "description": "Production-grade MCP server for Synthesizer V Studio 2 Pro",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mcp-svstudio": "./build/index.js"
+  },
+  "files": [
+    "build",
+    "sv-scripts"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x build/index.js",
+    "start": "node build/index.js",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "install-scripts": "node build/scripts/install-lua-scripts.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.7"
+  }
+}
