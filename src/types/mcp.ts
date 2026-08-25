@@ -149,6 +149,11 @@ export const GetSingingProjectSnapshotSchema = z.object({
   includeComputed: z.boolean().default(true).describe("Include SynthV engine-computed phonemes for every note")
 });
 
+export const BeginFreshMusicXmlChoirJobSchema = z.object({
+  musicxmlPath: z.string().min(1).describe("Absolute path to the uncompressed MusicXML authority"),
+  expectedOutputPath: z.string().min(1).describe("Absolute path for a new, not-yet-existing .svp output")
+});
+
 const TrackMapSchema = z.record(
   z.string(),
   z.number().int().min(0).describe("0-based SynthV track index")
@@ -156,6 +161,7 @@ const TrackMapSchema = z.record(
 
 export const AuditMusicXmlLyricsSchema = z.object({
   musicxmlPath: z.string().min(1).describe("Absolute path to an uncompressed .musicxml or .xml authority file"),
+  freshJobId: z.string().min(1).optional().describe("Job ID from begin_fresh_musicxml_choir_job; makes from-scratch provenance a mandatory audit gate"),
   trackMap: TrackMapSchema.describe("MusicXML part ID/name to 0-based SynthV track index"),
   profile: z.literal("ecclesiastical-latin").default("ecclesiastical-latin"),
   requireDirectPhonemes: z.boolean().default(true),

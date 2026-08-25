@@ -3,7 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { MailboxIPC } from "../src/ipc/mailbox.js";
-import { auditMusicXmlLyrics, repairMusicXmlLyrics } from "../src/choral/service.js";
+import { auditMusicXmlLyrics, beginFreshMusicXmlChoirJob, repairMusicXmlLyrics } from "../src/choral/service.js";
 import { BLICKS_PER_QUARTER, SingingProjectSnapshot } from "../src/choral/types.js";
 
 const xml = `<?xml version="1.0"?><score-partwise version="4.0">
@@ -90,5 +90,35 @@ describe("guarded MusicXML lyric repair service", () => {
     expect(fake.current.tracks[0].groups[0].notes.map((note) => note.lyrics)).toEqual([
       ".p r o", ".o", ".f u n", ".d i s"
     ]);
+  });
+
+  it("proves a from-scratch output was created after the job began", async () => {
+    const fake = new FakeIPC(brokenSnapshot());
+    const ipc = fake as unknown as MailboxIPC;
+    const outputPath = path.join(directory, "fresh-output.svp");
+    const job = await beginFreshMusicXmlChoirJob(ipc, { musicxmlPath, expectedOutputPath: outputPath });
+
+    fake.current.projectFileName = outputPath;
+    fake.current.tracks[0].groups[0].groupUUID = "fresh-group";
+    await fs.writeFile(outputPath, "fresh-svp".repeat(20), "utf8");
+
+    const audit = await auditMusicXmlLyrics(ipc, {
+      musicxmlPath,
+      freshJobId: job.jobId as string,
+      trackMap: { P1: 0 }
+    });
+    expect(audit.freshStart).toMatchObject({
+      verified: true,
+      jobId: job.jobId,
+      expectedOutputPath: outputPath
+    });
+  });
+
+  it("rejects an existing path as a fresh output target", async () => {
+    const ipc = new FakeIPC(brokenSnapshot()) as unknown as MailboxIPC;
+    const outputPath = path.join(directory, "already-there.svp");
+    await fs.writeFile(outputPath, "existing", "utf8");
+    await expect(beginFreshMusicXmlChoirJob(ipc, { musicxmlPath, expectedOutputPath: outputPath }))
+      .rejects.toThrow("FRESH_OUTPUT_PATH_EXISTS");
   });
 });

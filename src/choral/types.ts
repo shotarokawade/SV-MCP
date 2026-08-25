@@ -147,4 +147,15 @@ export interface LyricAuditResult {
   };
   defects: AuditDefect[];
   corrections: PlannedNoteCorrection[];
+  freshStart?: {
+    verified: true;
+    jobId: string;
+    startedAtEpochMs: number;
+    expectedOutputPath: string;
+    activeProjectFileName: string;
+    outputSize: number;
+    outputModifiedAtEpochMs: number;
+    baselineProjectFileName?: string;
+    baselineProjectFingerprint?: string;
+  };
 }

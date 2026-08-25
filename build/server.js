@@ -6,11 +6,11 @@ import * as os from "os";
 import { MailboxIPC } from "./ipc/mailbox.js";
 import * as schemas from "./types/mcp.js";
 import { validateParameterValue, validateMidiPitch, validateBlick } from "./engine/validator.js";
-import { auditMusicXmlLyrics, repairMusicXmlLyrics } from "./choral/service.js";
+import { auditMusicXmlLyrics, beginFreshMusicXmlChoirJob, repairMusicXmlLyrics } from "./choral/service.js";
 export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
     const server = new Server({
         name: "mcp-svstudio",
-        version: "1.1.0"
+        version: "1.2.0"
     }, {
         capabilities: {
             tools: {}
@@ -246,12 +246,25 @@ export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
             }
         },
         {
+            name: "begin_fresh_musicxml_choir_job",
+            description: "Start a verifiable from-scratch choir import. Records the MusicXML hash and current SynthV project fingerprint, rejects an existing output path, and returns a job ID that later lyric audits use to prove a new SVP was created and reopened.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    musicxmlPath: { type: "string", description: "Absolute .musicxml or .xml path" },
+                    expectedOutputPath: { type: "string", description: "Absolute path for a new, not-yet-existing .svp" }
+                },
+                required: ["musicxmlPath", "expectedOutputPath"]
+            }
+        },
+        {
             name: "audit_musicxml_lyrics",
             description: "Deterministically compare every lyric-bearing MusicXML note with the active SynthV project. Returns passed=false plus complete structural, lyric-placeholder, direct-phoneme, sil, and melisma-derived pronunciation defects. Agents must not report completion unless passed=true.",
             inputSchema: {
                 type: "object",
                 properties: {
                     musicxmlPath: { type: "string", description: "Absolute .musicxml or .xml path" },
+                    freshJobId: { type: "string", description: "Job ID from begin_fresh_musicxml_choir_job" },
                     trackMap: {
                         type: "object",
                         additionalProperties: { type: "number" },
@@ -275,6 +288,7 @@ export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
                 type: "object",
                 properties: {
                     musicxmlPath: { type: "string", description: "Absolute .musicxml or .xml path" },
+                    freshJobId: { type: "string", description: "Job ID from begin_fresh_musicxml_choir_job" },
                     trackMap: { type: "object", additionalProperties: { type: "number" }, default: {} },
                     profile: { type: "string", enum: ["ecclesiastical-latin"], default: "ecclesiastical-latin" },
                     requireDirectPhonemes: { type: "boolean", default: true },
@@ -609,6 +623,11 @@ export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
                 case "get_singing_project_snapshot": {
                     const args = schemas.GetSingingProjectSnapshotSchema.parse(rawArgs || {});
                     result = await ipc.execute("get_singing_project_snapshot", args, 30_000);
+                    break;
+                }
+                case "begin_fresh_musicxml_choir_job": {
+                    const args = schemas.BeginFreshMusicXmlChoirJobSchema.parse(rawArgs || {});
+                    result = await beginFreshMusicXmlChoirJob(ipc, args);
                     break;
                 }
                 case "audit_musicxml_lyrics": {

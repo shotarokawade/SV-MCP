@@ -123,6 +123,7 @@ Or manually copy the files in `sv-scripts/` to your Synthesizer V Studio scripts
 | `set_phonemes` | Directly sets formal space-separated phoneme strings (`Note.setPhonemes()`). |
 | `get_computed_phonemes` | Queries the internal text-to-phoneme engine results and computed attributes (`SV.getComputedAttributesForGroup`). |
 | `get_singing_project_snapshot` | Reads every track/group/note with group offsets, project-absolute onset, visible lyrics, direct phonemes, and computed phonemes in one call. |
+| `begin_fresh_musicxml_choir_job` | Starts a verifiable from-scratch MusicXML choir job, rejects a pre-existing output path, and records the source hash and baseline project fingerprint. |
 | `audit_musicxml_lyrics` | Compares an entire MusicXML authority against the active SynthV project and returns a deterministic pass/fail plus every structural, lyric, phoneme, `sil`, and placeholder defect. |
 | `repair_musicxml_lyrics` | Dry-runs or atomically applies the complete MusicXML-derived pronunciation plan, rejects stale audits/structural mismatches, and returns a post-repair audit. |
 | `get_note_attributes` | Gets note attributes (detune, languageOverride, phonesetOverride, musicalType, rapAccent, per-phoneme timing/strength). |
@@ -189,15 +190,17 @@ Using this MCP server, the LLM sets lyrics and phonemes directly via official AP
 
 ## Lunaでも省略できない全件歌詞監査
 
-合唱案件では、個別の`get_notes`や画面の目視だけで完了判定しない。次の3呼び出しを固定手順にする。
+合唱案件では、個別の`get_notes`や画面の目視だけで完了判定しない。新規案件は既存SVPを流用せず、次の4段階を固定手順にする。
 
-1. `audit_musicxml_lyrics`を呼び、`auditId`と全不具合を取得する。
-2. `repair_musicxml_lyrics`を同じ`auditId`でdry-runし、確認後に`dry_run: false`で一括適用する。
-3. 返された`postAudit.passed`が`true`であることを確認する。`false`、欠落、未取得の場合は未完了である。
+1. `begin_fresh_musicxml_choir_job`を、まだ存在しない新規SVP保存先で呼ぶ。
+2. 空のボイス先行テンプレートを作り、MusicXMLを`New Project`、テンプレートを`New Tracks`として読み込み、ノートグループ全体だけを移す。
+3. 返された`freshJobId`付きで`audit_musicxml_lyrics`を呼び、`auditId`と全不具合を取得する。
+4. `repair_musicxml_lyrics`を同じIDでdry-run後に一括適用し、`postAudit.passed`と`postAudit.freshStart.verified`が両方`true`であることを確認する。
 
 ```json
 {
   "musicxmlPath": "/absolute/path/De_profundis.musicxml",
+  "freshJobId": "begin_fresh_musicxml_choir_jobが返したjobId",
   "trackMap": {
     "P1": 0,
     "P2": 1,

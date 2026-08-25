@@ -1522,8 +1522,19 @@ export declare const GetSingingProjectSnapshotSchema: z.ZodObject<{
 }, {
     includeComputed?: boolean | undefined;
 }>;
+export declare const BeginFreshMusicXmlChoirJobSchema: z.ZodObject<{
+    musicxmlPath: z.ZodString;
+    expectedOutputPath: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    musicxmlPath: string;
+    expectedOutputPath: string;
+}, {
+    musicxmlPath: string;
+    expectedOutputPath: string;
+}>;
 export declare const AuditMusicXmlLyricsSchema: z.ZodObject<{
     musicxmlPath: z.ZodString;
+    freshJobId: z.ZodOptional<z.ZodString>;
     trackMap: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodNumber>>;
     profile: z.ZodDefault<z.ZodLiteral<"ecclesiastical-latin">>;
     requireDirectPhonemes: z.ZodDefault<z.ZodBoolean>;
@@ -1540,8 +1551,10 @@ export declare const AuditMusicXmlLyricsSchema: z.ZodObject<{
     verifyComputedPhonemes: boolean;
     onsetToleranceBlicks: number;
     durationToleranceBlicks: number;
+    freshJobId?: string | undefined;
 }, {
     musicxmlPath: string;
+    freshJobId?: string | undefined;
     trackMap?: Record<string, number> | undefined;
     profile?: "ecclesiastical-latin" | undefined;
     requireDirectPhonemes?: boolean | undefined;
@@ -1552,6 +1565,7 @@ export declare const AuditMusicXmlLyricsSchema: z.ZodObject<{
 }>;
 export declare const RepairMusicXmlLyricsSchema: z.ZodObject<{
     musicxmlPath: z.ZodString;
+    freshJobId: z.ZodOptional<z.ZodString>;
     trackMap: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodNumber>>;
     profile: z.ZodDefault<z.ZodLiteral<"ecclesiastical-latin">>;
     requireDirectPhonemes: z.ZodDefault<z.ZodBoolean>;
@@ -1576,10 +1590,12 @@ export declare const RepairMusicXmlLyricsSchema: z.ZodObject<{
     durationToleranceBlicks: number;
     rewriteLyrics: boolean;
     renderWaitMs: number;
+    freshJobId?: string | undefined;
     auditId?: string | undefined;
 }, {
     musicxmlPath: string;
     dry_run?: boolean | undefined;
+    freshJobId?: string | undefined;
     trackMap?: Record<string, number> | undefined;
     profile?: "ecclesiastical-latin" | undefined;
     requireDirectPhonemes?: boolean | undefined;

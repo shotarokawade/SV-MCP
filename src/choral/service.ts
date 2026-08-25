@@ -2,12 +2,25 @@ import * as crypto from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { MailboxIPC } from "../ipc/mailbox.js";
-import { auditMusicXmlAgainstSnapshot } from "./audit.js";
+import { auditMusicXmlAgainstSnapshot, fingerprintSnapshot } from "./audit.js";
 import { parseMusicXml } from "./musicxml.js";
 import { AuditOptions, LyricAuditResult, SingingProjectSnapshot } from "./types.js";
 
+interface FreshChoirJob {
+  jobId: string;
+  musicxmlPath: string;
+  sourceSha256: string;
+  expectedOutputPath: string;
+  startedAtEpochMs: number;
+  baselineProjectFileName?: string;
+  baselineProjectFingerprint?: string;
+}
+
+const freshChoirJobs = new Map<string, FreshChoirJob>();
+
 export interface AuditRequest {
   musicxmlPath: string;
+  freshJobId?: string;
   trackMap?: Record<string, number>;
   profile?: "ecclesiastical-latin";
   requireDirectPhonemes?: boolean;
@@ -15,6 +28,11 @@ export interface AuditRequest {
   verifyComputedPhonemes?: boolean;
   onsetToleranceBlicks?: number;
   durationToleranceBlicks?: number;
+}
+
+export interface BeginFreshChoirJobRequest {
+  musicxmlPath: string;
+  expectedOutputPath: string;
 }
 
 export interface RepairRequest extends AuditRequest {
@@ -50,12 +68,126 @@ async function snapshot(ipc: MailboxIPC, includeComputed: boolean): Promise<Sing
   return ipc.execute("get_singing_project_snapshot", { includeComputed }, 30_000);
 }
 
+function sameProjectPath(actual: string, expected: string): boolean {
+  if (!actual) return false;
+  if (path.isAbsolute(actual)) return path.resolve(actual) === path.resolve(expected);
+  return path.basename(actual) === path.basename(expected);
+}
+
+export async function beginFreshMusicXmlChoirJob(
+  ipc: MailboxIPC,
+  request: BeginFreshChoirJobRequest
+): Promise<Record<string, unknown>> {
+  const source = await loadMusicXml(request.musicxmlPath);
+  const score = parseMusicXml(source.xml);
+  if (!path.isAbsolute(request.expectedOutputPath) || path.extname(request.expectedOutputPath).toLowerCase() !== ".svp") {
+    throw new Error("expectedOutputPath must be an absolute, new .svp path");
+  }
+  try {
+    await fs.stat(request.expectedOutputPath);
+    throw new Error("FRESH_OUTPUT_PATH_EXISTS: choose a new output path; existing SVP files cannot prove a from-scratch run");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  let baseline: SingingProjectSnapshot | undefined;
+  try {
+    const health = await ipc.checkHealth();
+    if (health.healthy) baseline = await snapshot(ipc, false);
+  } catch {
+    // A truly fresh run may begin while SynthV has no project window or handler.
+  }
+  const startedAtEpochMs = Date.now();
+  const baselineProjectFingerprint = baseline ? fingerprintSnapshot(baseline) : undefined;
+  const jobId = crypto.createHash("sha256").update(JSON.stringify({
+    sourceSha256: source.sha256,
+    expectedOutputPath: path.resolve(request.expectedOutputPath),
+    startedAtEpochMs,
+    baselineProjectFingerprint
+  })).digest("hex");
+  const job: FreshChoirJob = {
+    jobId,
+    musicxmlPath: path.resolve(request.musicxmlPath),
+    sourceSha256: source.sha256,
+    expectedOutputPath: path.resolve(request.expectedOutputPath),
+    startedAtEpochMs,
+    baselineProjectFileName: baseline?.projectFileName || undefined,
+    baselineProjectFingerprint
+  };
+  freshChoirJobs.set(jobId, job);
+  return {
+    success: true,
+    jobId,
+    startedAtEpochMs,
+    sourceSha256: source.sha256,
+    expectedOutputPath: job.expectedOutputPath,
+    baselineProjectFileName: job.baselineProjectFileName ?? null,
+    baselineProjectFingerprint: job.baselineProjectFingerprint ?? null,
+    source: {
+      title: score.title ?? null,
+      partCount: score.parts.length,
+      parts: score.parts.map((part) => ({
+        id: part.id,
+        name: part.name,
+        noteCount: part.notes.length,
+        lyricEventCount: part.notes.filter((note) => note.lyric?.text).length
+      }))
+    },
+    requiredWorkflow: [
+      "Create and GUI-verify an empty voice-first template",
+      "Import MusicXML as New Project",
+      "Import the empty template as New Tracks",
+      "Move complete MusicXML note groups only",
+      "Save to expectedOutputPath",
+      "Audit with this freshJobId"
+    ]
+  };
+}
+
+async function verifyFreshStart(
+  request: AuditRequest,
+  sourceSha256: string,
+  current: SingingProjectSnapshot,
+  projectFingerprint: string
+): Promise<NonNullable<LyricAuditResult["freshStart"]> | undefined> {
+  if (!request.freshJobId) return undefined;
+  const job = freshChoirJobs.get(request.freshJobId);
+  if (!job) throw new Error("FRESH_JOB_NOT_FOUND: call begin_fresh_musicxml_choir_job in this MCP session before starting GUI work");
+  if (path.resolve(request.musicxmlPath) !== job.musicxmlPath || sourceSha256 !== job.sourceSha256) {
+    throw new Error("FRESH_SOURCE_CHANGED: the MusicXML path or contents differ from the job start");
+  }
+  if (!sameProjectPath(current.projectFileName, job.expectedOutputPath)) {
+    throw new Error(`FRESH_PROJECT_PATH_MISMATCH: save and reopen ${job.expectedOutputPath} before auditing`);
+  }
+  if (job.baselineProjectFingerprint && projectFingerprint === job.baselineProjectFingerprint) {
+    throw new Error("FRESH_PROJECT_UNCHANGED: the active SynthV project is still the project seen at job start");
+  }
+  const stat = await fs.stat(job.expectedOutputPath).catch(() => undefined);
+  if (!stat || stat.size < 100 || stat.mtimeMs + 1000 < job.startedAtEpochMs) {
+    throw new Error("FRESH_OUTPUT_NOT_CREATED: the new SVP has not been saved after this job began");
+  }
+  return {
+    verified: true,
+    jobId: job.jobId,
+    startedAtEpochMs: job.startedAtEpochMs,
+    expectedOutputPath: job.expectedOutputPath,
+    activeProjectFileName: current.projectFileName,
+    outputSize: stat.size,
+    outputModifiedAtEpochMs: stat.mtimeMs,
+    baselineProjectFileName: job.baselineProjectFileName,
+    baselineProjectFingerprint: job.baselineProjectFingerprint
+  };
+}
+
 export async function auditMusicXmlLyrics(ipc: MailboxIPC, request: AuditRequest): Promise<LyricAuditResult> {
   const source = await loadMusicXml(request.musicxmlPath);
   const score = parseMusicXml(source.xml);
   const options = optionsFromRequest(request);
   const current = await snapshot(ipc, options.verifyComputedPhonemes);
-  return auditMusicXmlAgainstSnapshot(score, source.sha256, current, options);
+  const audit = auditMusicXmlAgainstSnapshot(score, source.sha256, current, options);
+  const freshStart = await verifyFreshStart(request, source.sha256, current, audit.projectFingerprint);
+  if (freshStart) audit.freshStart = freshStart;
+  return audit;
 }
 
 function correctionOperations(audit: LyricAuditResult, rewriteLyrics: boolean): Array<Record<string, unknown>> {
