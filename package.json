@@ -1,6 +1,6 @@
 {
   "name": "mcp-svstudio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Production-grade MCP server for Synthesizer V Studio 2 Pro",
   "private": true,
   "type": "module",
@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.0",
+    "fast-xml-parser": "^5.11.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

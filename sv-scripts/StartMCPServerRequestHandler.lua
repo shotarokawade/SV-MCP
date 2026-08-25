@@ -299,7 +299,7 @@ local function update_heartbeat()
       project = project and project:getFileName() or "Untitled",
       trackCount = project and project:getNumTracks() or 0,
       playhead = playback and playback:getPlayhead() or 0,
-      version = "1.0.0",
+      version = "1.1.0",
       synthVVersion = 2
     }
     write_file_atomic(heartbeatPath, json.stringify(hb))
@@ -365,7 +365,7 @@ handlers.get_server_status = function(params)
   local playback = SV:getPlayback()
   return {
     status = "running",
-    version = "1.0.0",
+    version = "1.1.0",
     projectLoaded = project ~= nil,
     projectFileName = project and project:getFileName() or "",
     projectDuration = project and project:getDuration() or 0,
@@ -467,6 +467,75 @@ handlers.get_notes = function(params)
     groupName = targetGroup:getName(),
     groupUUID = targetGroup:getUUID(),
     notes = notes
+  }
+end
+
+handlers.get_singing_project_snapshot = function(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  local includeComputed = params.includeComputed ~= false
+  local tracks = {}
+
+  for trackIndex1 = 1, project:getNumTracks() do
+    local track = project:getTrack(trackIndex1)
+    local trackResult = {
+      trackIndex = trackIndex1 - 1,
+      trackName = track:getName(),
+      groups = {}
+    }
+    for groupIndex1 = 1, track:getNumGroups() do
+      local groupRef = track:getGroupReference(groupIndex1)
+      local targetGroup = groupRef:getTarget()
+      local timeOffset = groupRef:getTimeOffset() or 0
+      local pitchOffset = groupRef:getPitchOffset() or 0
+      local computedAttrs = nil
+      local computedPhonemes = nil
+      if includeComputed then
+        local attrsOk, attrsValue = pcall(function()
+          return SV:getComputedAttributesForGroup(groupRef)
+        end)
+        if attrsOk then computedAttrs = attrsValue end
+        local phonemesOk, phonemesValue = pcall(function()
+          return SV:getPhonemesForGroup(groupRef)
+        end)
+        if phonemesOk then computedPhonemes = phonemesValue end
+      end
+      local notes = {}
+      for noteIndex1 = 1, targetGroup:getNumNotes() do
+        local note = targetGroup:getNote(noteIndex1)
+        local computed = computedPhonemes and computedPhonemes[noteIndex1] or ""
+        table.insert(notes, {
+          noteIndex = noteIndex1 - 1,
+          localOnset = note:getOnset(),
+          absoluteOnset = timeOffset + note:getOnset(),
+          duration = note:getDuration(),
+          pitch = note:getPitch(),
+          effectivePitch = pitchOffset + note:getPitch(),
+          lyrics = note:getLyrics(),
+          userPhonemes = note:getPhonemes(),
+          computedPhonemeString = computed or "",
+          computedAttributes = computedAttrs and computedAttrs[noteIndex1] or {},
+          languageOverride = note:getLanguageOverride() or "",
+          musicalType = note:getMusicalType() or "sing"
+        })
+      end
+      table.insert(trackResult.groups, {
+        groupIndex = groupIndex1 - 1,
+        groupName = targetGroup:getName(),
+        groupUUID = targetGroup:getUUID(),
+        timeOffset = timeOffset,
+        pitchOffset = pitchOffset,
+        computedReady = (not includeComputed) or (computedPhonemes ~= nil and #computedPhonemes == targetGroup:getNumNotes()),
+        notes = notes
+      })
+    end
+    table.insert(tracks, trackResult)
+  end
+
+  return {
+    projectFileName = project:getFileName(),
+    capturedAtEpochMs = os.time() * 1000,
+    tracks = tracks
   }
 end
 

@@ -6,10 +6,11 @@ import * as os from "os";
 import { MailboxIPC } from "./ipc/mailbox.js";
 import * as schemas from "./types/mcp.js";
 import { validateParameterValue, validateMidiPitch, validateBlick } from "./engine/validator.js";
+import { auditMusicXmlLyrics, repairMusicXmlLyrics } from "./choral/service.js";
 export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
     const server = new Server({
         name: "mcp-svstudio",
-        version: "1.0.0"
+        version: "1.1.0"
     }, {
         capabilities: {
             tools: {}
@@ -232,6 +233,61 @@ export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
                     trackIndex: { type: "number", default: 0 },
                     groupIndex: { type: "number", default: 0 }
                 }
+            }
+        },
+        {
+            name: "get_singing_project_snapshot",
+            description: "Read every SynthV track, group reference, absolute note position, visible lyric, direct phoneme, and computed phoneme in one call. Use this instead of manually iterating groups for whole-score verification.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    includeComputed: { type: "boolean", default: true, description: "Include engine-computed phonemes" }
+                }
+            }
+        },
+        {
+            name: "audit_musicxml_lyrics",
+            description: "Deterministically compare every lyric-bearing MusicXML note with the active SynthV project. Returns passed=false plus complete structural, lyric-placeholder, direct-phoneme, sil, and melisma-derived pronunciation defects. Agents must not report completion unless passed=true.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    musicxmlPath: { type: "string", description: "Absolute .musicxml or .xml path" },
+                    trackMap: {
+                        type: "object",
+                        additionalProperties: { type: "number" },
+                        default: {},
+                        description: "MusicXML part ID/name to 0-based SynthV track index"
+                    },
+                    profile: { type: "string", enum: ["ecclesiastical-latin"], default: "ecclesiastical-latin" },
+                    requireDirectPhonemes: { type: "boolean", default: true },
+                    requireDirectLyricLabels: { type: "boolean", default: true },
+                    verifyComputedPhonemes: { type: "boolean", default: true },
+                    onsetToleranceBlicks: { type: "number", default: 1 },
+                    durationToleranceBlicks: { type: "number", default: 1 }
+                },
+                required: ["musicxmlPath"]
+            }
+        },
+        {
+            name: "repair_musicxml_lyrics",
+            description: "Create or atomically apply the complete MusicXML-derived direct-phoneme correction plan, then re-audit the active project. Defaults to dry-run. A real mutation requires the fresh auditId returned by audit_musicxml_lyrics and refuses structural mismatches.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    musicxmlPath: { type: "string", description: "Absolute .musicxml or .xml path" },
+                    trackMap: { type: "object", additionalProperties: { type: "number" }, default: {} },
+                    profile: { type: "string", enum: ["ecclesiastical-latin"], default: "ecclesiastical-latin" },
+                    requireDirectPhonemes: { type: "boolean", default: true },
+                    requireDirectLyricLabels: { type: "boolean", default: true },
+                    verifyComputedPhonemes: { type: "boolean", default: true },
+                    onsetToleranceBlicks: { type: "number", default: 1 },
+                    durationToleranceBlicks: { type: "number", default: 1 },
+                    auditId: { type: "string", description: "Fresh auditId; required when dry_run=false" },
+                    dry_run: { type: "boolean", default: true },
+                    rewriteLyrics: { type: "boolean", default: true },
+                    renderWaitMs: { type: "number", default: 15000, maximum: 60000 }
+                },
+                required: ["musicxmlPath"]
             }
         },
         // 6. Note Attributes & Per-Phoneme Attributes
@@ -548,6 +604,21 @@ export function createSynthesizerVMcpServer(ipc = new MailboxIPC()) {
                 case "get_computed_phonemes": {
                     const args = schemas.GetComputedPhonemesSchema.parse(rawArgs || {});
                     result = await ipc.execute("get_computed_phonemes", args);
+                    break;
+                }
+                case "get_singing_project_snapshot": {
+                    const args = schemas.GetSingingProjectSnapshotSchema.parse(rawArgs || {});
+                    result = await ipc.execute("get_singing_project_snapshot", args, 30_000);
+                    break;
+                }
+                case "audit_musicxml_lyrics": {
+                    const args = schemas.AuditMusicXmlLyricsSchema.parse(rawArgs || {});
+                    result = await auditMusicXmlLyrics(ipc, args);
+                    break;
+                }
+                case "repair_musicxml_lyrics": {
+                    const args = schemas.RepairMusicXmlLyricsSchema.parse(rawArgs || {});
+                    result = await repairMusicXmlLyrics(ipc, args);
                     break;
                 }
                 case "get_note_attributes": {

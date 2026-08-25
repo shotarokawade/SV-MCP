@@ -122,6 +122,9 @@ Or manually copy the files in `sv-scripts/` to your Synthesizer V Studio scripts
 | `get_phonemes` | Retrieves user-specified phonemes for note(s). |
 | `set_phonemes` | Directly sets formal space-separated phoneme strings (`Note.setPhonemes()`). |
 | `get_computed_phonemes` | Queries the internal text-to-phoneme engine results and computed attributes (`SV.getComputedAttributesForGroup`). |
+| `get_singing_project_snapshot` | Reads every track/group/note with group offsets, project-absolute onset, visible lyrics, direct phonemes, and computed phonemes in one call. |
+| `audit_musicxml_lyrics` | Compares an entire MusicXML authority against the active SynthV project and returns a deterministic pass/fail plus every structural, lyric, phoneme, `sil`, and placeholder defect. |
+| `repair_musicxml_lyrics` | Dry-runs or atomically applies the complete MusicXML-derived pronunciation plan, rejects stale audits/structural mismatches, and returns a post-repair audit. |
 | `get_note_attributes` | Gets note attributes (detune, languageOverride, phonesetOverride, musicalType, rapAccent, per-phoneme timing/strength). |
 | `set_note_attributes` | Modifies note attributes and per-phoneme attributes (`phonemes: [{ leftOffset, position, activity, strength }]`). |
 | `get_voice` | Gets voice parameters on `NoteGroupReference` (loudness, tension, breathiness, gender, toneShift, vocalModeParams). |
@@ -183,6 +186,34 @@ Using this MCP server, the LLM sets lyrics and phonemes directly via official AP
        │ 5. `batch_edit` with `dry_run: false` to apply notes and `set_phonemes`
        │ 6. `get_computed_phonemes` to verify synthesis pronunciation
 ```
+
+## Lunaでも省略できない全件歌詞監査
+
+合唱案件では、個別の`get_notes`や画面の目視だけで完了判定しない。次の3呼び出しを固定手順にする。
+
+1. `audit_musicxml_lyrics`を呼び、`auditId`と全不具合を取得する。
+2. `repair_musicxml_lyrics`を同じ`auditId`でdry-runし、確認後に`dry_run: false`で一括適用する。
+3. 返された`postAudit.passed`が`true`であることを確認する。`false`、欠落、未取得の場合は未完了である。
+
+```json
+{
+  "musicxmlPath": "/absolute/path/De_profundis.musicxml",
+  "trackMap": {
+    "P1": 0,
+    "P2": 1,
+    "P3": 2,
+    "P4": 3
+  },
+  "profile": "ecclesiastical-latin",
+  "requireDirectPhonemes": true,
+  "requireDirectLyricLabels": true,
+  "verifyComputedPhonemes": true
+}
+```
+
+実適用には直前の監査が返した`auditId`が必要である。MusicXML、ノート配置、歌詞、直接音素のいずれかが変わると監査IDが古くなり、`STALE_AUDIT`として拒否される。音符数、音高、開始位置、音価などの構造不一致がある場合も自動補正せず、`requiresSourceReimport: true`を返す。
+
+現行実装のMusicXML入力は、非圧縮の`.musicxml`または`.xml`、`score-partwise`、原則1声部1パートを対象とする。複数の歌詞付きvoiceを同一パートへ含める場合は、声部ごとに分けて書き出す。
 
 ---
 

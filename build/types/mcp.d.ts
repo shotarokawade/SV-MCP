@@ -1515,6 +1515,82 @@ export declare const GetComputedPhonemesSchema: z.ZodObject<{
     trackIndex?: number | undefined;
     groupIndex?: number | undefined;
 }>;
+export declare const GetSingingProjectSnapshotSchema: z.ZodObject<{
+    includeComputed: z.ZodDefault<z.ZodBoolean>;
+}, "strip", z.ZodTypeAny, {
+    includeComputed: boolean;
+}, {
+    includeComputed?: boolean | undefined;
+}>;
+export declare const AuditMusicXmlLyricsSchema: z.ZodObject<{
+    musicxmlPath: z.ZodString;
+    trackMap: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodNumber>>;
+    profile: z.ZodDefault<z.ZodLiteral<"ecclesiastical-latin">>;
+    requireDirectPhonemes: z.ZodDefault<z.ZodBoolean>;
+    requireDirectLyricLabels: z.ZodDefault<z.ZodBoolean>;
+    verifyComputedPhonemes: z.ZodDefault<z.ZodBoolean>;
+    onsetToleranceBlicks: z.ZodDefault<z.ZodNumber>;
+    durationToleranceBlicks: z.ZodDefault<z.ZodNumber>;
+}, "strip", z.ZodTypeAny, {
+    musicxmlPath: string;
+    trackMap: Record<string, number>;
+    profile: "ecclesiastical-latin";
+    requireDirectPhonemes: boolean;
+    requireDirectLyricLabels: boolean;
+    verifyComputedPhonemes: boolean;
+    onsetToleranceBlicks: number;
+    durationToleranceBlicks: number;
+}, {
+    musicxmlPath: string;
+    trackMap?: Record<string, number> | undefined;
+    profile?: "ecclesiastical-latin" | undefined;
+    requireDirectPhonemes?: boolean | undefined;
+    requireDirectLyricLabels?: boolean | undefined;
+    verifyComputedPhonemes?: boolean | undefined;
+    onsetToleranceBlicks?: number | undefined;
+    durationToleranceBlicks?: number | undefined;
+}>;
+export declare const RepairMusicXmlLyricsSchema: z.ZodObject<{
+    musicxmlPath: z.ZodString;
+    trackMap: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodNumber>>;
+    profile: z.ZodDefault<z.ZodLiteral<"ecclesiastical-latin">>;
+    requireDirectPhonemes: z.ZodDefault<z.ZodBoolean>;
+    requireDirectLyricLabels: z.ZodDefault<z.ZodBoolean>;
+    verifyComputedPhonemes: z.ZodDefault<z.ZodBoolean>;
+    onsetToleranceBlicks: z.ZodDefault<z.ZodNumber>;
+    durationToleranceBlicks: z.ZodDefault<z.ZodNumber>;
+} & {
+    auditId: z.ZodOptional<z.ZodString>;
+    dry_run: z.ZodDefault<z.ZodBoolean>;
+    rewriteLyrics: z.ZodDefault<z.ZodBoolean>;
+    renderWaitMs: z.ZodDefault<z.ZodNumber>;
+}, "strip", z.ZodTypeAny, {
+    dry_run: boolean;
+    musicxmlPath: string;
+    trackMap: Record<string, number>;
+    profile: "ecclesiastical-latin";
+    requireDirectPhonemes: boolean;
+    requireDirectLyricLabels: boolean;
+    verifyComputedPhonemes: boolean;
+    onsetToleranceBlicks: number;
+    durationToleranceBlicks: number;
+    rewriteLyrics: boolean;
+    renderWaitMs: number;
+    auditId?: string | undefined;
+}, {
+    musicxmlPath: string;
+    dry_run?: boolean | undefined;
+    trackMap?: Record<string, number> | undefined;
+    profile?: "ecclesiastical-latin" | undefined;
+    requireDirectPhonemes?: boolean | undefined;
+    requireDirectLyricLabels?: boolean | undefined;
+    verifyComputedPhonemes?: boolean | undefined;
+    onsetToleranceBlicks?: number | undefined;
+    durationToleranceBlicks?: number | undefined;
+    auditId?: string | undefined;
+    rewriteLyrics?: boolean | undefined;
+    renderWaitMs?: number | undefined;
+}>;
 export declare const GetNoteAttributesSchema: z.ZodObject<{
     trackIndex: z.ZodDefault<z.ZodNumber>;
     groupIndex: z.ZodDefault<z.ZodNumber>;

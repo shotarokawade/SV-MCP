@@ -76,4 +76,18 @@ describe("MCP Tool Schemas", () => {
     });
     expect(valid.success).toBe(true);
   });
+
+  it("validates whole-score lyric audit and guarded repair schemas", () => {
+    expect(schemas.AuditMusicXmlLyricsSchema.safeParse({
+      musicxmlPath: "/tmp/source.musicxml",
+      trackMap: { Superius: 0 }
+    }).success).toBe(true);
+
+    expect(schemas.RepairMusicXmlLyricsSchema.safeParse({
+      musicxmlPath: "/tmp/source.musicxml",
+      trackMap: { Superius: 0 },
+      auditId: "fresh-audit",
+      dry_run: false
+    }).success).toBe(true);
+  });
 });

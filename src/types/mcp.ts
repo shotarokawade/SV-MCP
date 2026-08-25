@@ -145,6 +145,33 @@ export const GetComputedPhonemesSchema = z.object({
   groupIndex: z.number().int().min(0).default(0).describe("0-based group reference index")
 });
 
+export const GetSingingProjectSnapshotSchema = z.object({
+  includeComputed: z.boolean().default(true).describe("Include SynthV engine-computed phonemes for every note")
+});
+
+const TrackMapSchema = z.record(
+  z.string(),
+  z.number().int().min(0).describe("0-based SynthV track index")
+).default({});
+
+export const AuditMusicXmlLyricsSchema = z.object({
+  musicxmlPath: z.string().min(1).describe("Absolute path to an uncompressed .musicxml or .xml authority file"),
+  trackMap: TrackMapSchema.describe("MusicXML part ID/name to 0-based SynthV track index"),
+  profile: z.literal("ecclesiastical-latin").default("ecclesiastical-latin"),
+  requireDirectPhonemes: z.boolean().default(true),
+  requireDirectLyricLabels: z.boolean().default(true).describe("Require visible SynthV lyrics to contain the planned direct phonemes, eliminating + and - placeholders"),
+  verifyComputedPhonemes: z.boolean().default(true),
+  onsetToleranceBlicks: z.number().int().min(0).default(1),
+  durationToleranceBlicks: z.number().int().min(0).default(1)
+});
+
+export const RepairMusicXmlLyricsSchema = AuditMusicXmlLyricsSchema.extend({
+  auditId: z.string().min(1).optional().describe("Required for a real mutation; returned by audit_musicxml_lyrics"),
+  dry_run: z.boolean().default(true),
+  rewriteLyrics: z.boolean().default(true).describe("Replace placeholder/source labels with MusicXML-derived direct-phoneme labels in the same atomic batch"),
+  renderWaitMs: z.number().int().min(0).max(60_000).default(15_000)
+});
+
 export const GetNoteAttributesSchema = z.object({
   trackIndex: z.number().int().min(0).default(0).describe("0-based track index"),
   groupIndex: z.number().int().min(0).default(0).describe("0-based group reference index"),
