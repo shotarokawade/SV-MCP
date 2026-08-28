@@ -70,6 +70,12 @@ export const VoiceSettingsSchema = z.object({
 }).passthrough();
 // Tool Input Schemas
 export const GetServerStatusSchema = z.object({});
+export const OpenProjectFileSchema = z.object({
+    path: z.string().min(1),
+    dry_run: z.boolean().default(true),
+    allowReplaceCurrentProject: z.boolean().default(false),
+    application: z.string().min(1).optional()
+});
 export const GetProjectInfoSchema = z.object({});
 export const ListTracksSchema = z.object({});
 export const ListGroupsSchema = z.object({});

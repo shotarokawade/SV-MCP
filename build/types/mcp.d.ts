@@ -670,6 +670,22 @@ export declare const VoiceSettingsSchema: z.ZodObject<{
     }>>>;
 }, z.ZodTypeAny, "passthrough">>;
 export declare const GetServerStatusSchema: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+export declare const OpenProjectFileSchema: z.ZodObject<{
+    path: z.ZodString;
+    dry_run: z.ZodDefault<z.ZodBoolean>;
+    allowReplaceCurrentProject: z.ZodDefault<z.ZodBoolean>;
+    application: z.ZodOptional<z.ZodString>;
+}, "strip", z.ZodTypeAny, {
+    path: string;
+    dry_run: boolean;
+    allowReplaceCurrentProject: boolean;
+    application?: string | undefined;
+}, {
+    path: string;
+    dry_run?: boolean | undefined;
+    allowReplaceCurrentProject?: boolean | undefined;
+    application?: string | undefined;
+}>;
 export declare const GetProjectInfoSchema: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
 export declare const ListTracksSchema: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
 export declare const ListGroupsSchema: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
@@ -909,6 +925,7 @@ export declare const AddNotesSchema: z.ZodObject<{
 }, "strip", z.ZodTypeAny, {
     trackIndex: number;
     groupIndex: number;
+    dry_run: boolean;
     notes: {
         onset: number;
         pitch: number;
@@ -952,7 +969,6 @@ export declare const AddNotesSchema: z.ZodObject<{
             phonesetOverride: z.ZodOptional<z.ZodString>;
         }, z.ZodTypeAny, "passthrough"> | undefined;
     }[];
-    dry_run: boolean;
 }, {
     notes: {
         onset: number;
@@ -1240,6 +1256,7 @@ export declare const UpdateNotesSchema: z.ZodObject<{
 }, "strip", z.ZodTypeAny, {
     trackIndex: number;
     groupIndex: number;
+    dry_run: boolean;
     notes: {
         noteIndex?: number | undefined;
         onset?: number | undefined;
@@ -1292,7 +1309,6 @@ export declare const UpdateNotesSchema: z.ZodObject<{
             lyrics?: string | undefined;
         } | undefined;
     }[];
-    dry_run: boolean;
 }, {
     notes: {
         noteIndex?: number | undefined;
@@ -1963,9 +1979,9 @@ export declare const SetParametersSchema: z.ZodObject<{
     paramName: string;
     trackIndex?: number | undefined;
     groupIndex?: number | undefined;
+    dry_run?: boolean | undefined;
     minOnset?: number | undefined;
     maxOnset?: number | undefined;
-    dry_run?: boolean | undefined;
     mode?: "add" | "replace_all" | "remove_range" | undefined;
     points?: [number, number][] | undefined;
     simplifyThreshold?: number | undefined;

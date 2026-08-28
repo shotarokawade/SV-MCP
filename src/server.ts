@@ -12,6 +12,7 @@ import { MailboxIPC } from "./ipc/mailbox.js";
 import * as schemas from "./types/mcp.js";
 import { validateParameterValue, validateMidiPitch, validateBlick } from "./engine/validator.js";
 import { auditMusicXmlLyrics, beginFreshMusicXmlChoirJob, repairMusicXmlLyrics } from "./choral/service.js";
+import { openProjectFile } from "./project-file.js";
 
 export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()): Server {
   const server = new Server(
@@ -52,6 +53,20 @@ export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()):
       inputSchema: {
         type: "object",
         properties: {}
+      }
+    },
+    {
+      name: "open_project_file",
+      description: "Deterministically ask macOS to open an absolute SVP/MusicXML/MIDI file in Synthesizer V. Defaults to dry-run and requires explicit replacement authorization. The caller must verify the resulting live project through MCP.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute project or import file path" },
+          dry_run: { type: "boolean", default: true },
+          allowReplaceCurrentProject: { type: "boolean", default: false },
+          application: { type: "string", description: "macOS application name override" }
+        },
+        required: ["path"]
       }
     },
     // 2. Tracks & Groups
@@ -554,6 +569,12 @@ export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()):
         case "get_project_info": {
           schemas.GetProjectInfoSchema.parse(rawArgs || {});
           result = await ipc.execute("get_project_info", rawArgs || {});
+          break;
+        }
+
+        case "open_project_file": {
+          const args = schemas.OpenProjectFileSchema.parse(rawArgs || {});
+          result = await openProjectFile(args);
           break;
         }
 
