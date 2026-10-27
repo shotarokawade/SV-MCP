@@ -13,6 +13,10 @@ import * as schemas from "./types/mcp.js";
 import { validateParameterValue, validateMidiPitch, validateBlick } from "./engine/validator.js";
 import { auditMusicXmlLyrics, beginFreshMusicXmlChoirJob, repairMusicXmlLyrics } from "./choral/service.js";
 import { openProjectFile } from "./project-file.js";
+import { inspectMusicXml } from "./choral/inspect.js";
+import { inspectMidi } from "./choral/midi.js";
+import { prepareLane } from "./choral/import-lane.js";
+import { expressionPoints } from "./engine/presets.js";
 
 export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()): Server {
   const server = new Server(
@@ -308,7 +312,7 @@ export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()):
     },
     {
       name: "repair_musicxml_lyrics",
-      description: "Create or atomically apply the complete MusicXML-derived direct-phoneme correction plan, then re-audit the active project. Defaults to dry-run. A real mutation requires the fresh auditId returned by audit_musicxml_lyrics and refuses structural mismatches.",
+      description: "Create or apply the complete MusicXML-derived direct-phoneme correction plan, then re-audit the active project; a failed batch may require multiple Undo operations. Defaults to dry-run. A real mutation requires the fresh auditId returned by audit_musicxml_lyrics and refuses structural mismatches.",
       inputSchema: {
         type: "object",
         properties: {
@@ -441,6 +445,66 @@ export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()):
         required: ["paramName"]
       }
     },
+    {
+      name: "get_computed_pitch",
+      description: "Sample SynthV computed pitch (MIDI semitones) at project-absolute blick positions. Requires SynthV 2.1.1+; inspect readiness and audition.",
+      inputSchema: { type: "object", properties: { trackIndex: { type: "integer", default: 0 }, groupIndex: { type: "integer", default: 0 }, start: { type: "integer", minimum: 0 }, interval: { type: "integer", minimum: 1 }, frames: { type: "integer", minimum: 1, maximum: 10000 } }, required: ["start", "interval", "frames"] }
+    },
+    {
+      name: "get_pitch_controls",
+      description: "Read SynthV 2 pitch points and curves and return a snapshot required for editing. Positions are group-local blicks.",
+      inputSchema: { type: "object", properties: { trackIndex: { type: "integer", default: 0 }, groupIndex: { type: "integer", default: 0 } } }
+    },
+    {
+      name: "edit_pitch_control",
+      description: "Add, update or delete one SynthV 2 pitch point/curve. Supply the latest snapshot from get_pitch_controls. Defaults to dry-run; shared groups require explicit acknowledgement.",
+      inputSchema: { type: "object", properties: {
+        trackIndex: { type: "integer", default: 0 }, groupIndex: { type: "integer", default: 0 }, expectedSnapshot: { type: "string" },
+        operation: { type: "string", enum: ["add", "update", "delete"] }, index: { type: "integer", minimum: 0 },
+        type: { type: "string", enum: ["point", "curve"] }, position: { type: "integer", minimum: 0 }, pitch: { type: "number", minimum: 0, maximum: 127 },
+        points: { type: "array", items: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 } },
+        allowSharedGroup: { type: "boolean", default: false }, dry_run: { type: "boolean", default: true }
+      }, required: ["expectedSnapshot", "operation"] }
+    },
+    { name: "get_editor_context", description: "Read current editor track, group and selected notes; indices are zero-based.", inputSchema: {type:"object",properties:{}} },
+    { name: "convert_time", description: "Convert project time using the actual tempo map.", inputSchema: {type:"object",properties:{unit:{type:"string",enum:["blick","seconds","quarter"]},value:{type:"number",minimum:0}},required:["unit","value"]} },
+    { name: "sample_parameter", description: "Sample one automation parameter at group-local blick positions.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},paramName:{type:"string"},positions:{type:"array",items:{type:"integer"},minItems:1,maxItems:1000}},required:["paramName","positions"]} },
+    { name: "get_track_state", description: "Read track, mixer and a snapshot for safe edits.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer",minimum:0,default:0}}} },
+    { name: "edit_track_state", description: "Update track name, color, export, gain, pan, mute or solo using a fresh track snapshot; defaults to dry-run.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer",minimum:0},expectedSnapshot:{type:"string"},name:{type:"string"},color:{type:"string"},bounced:{type:"boolean"},gain:{type:"number"},pan:{type:"number"},mute:{type:"boolean"},solo:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot"]} },
+    { name: "get_group_reference", description: "Read group reference offsets, mute and fresh edit snapshot.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"}}} },
+    { name: "edit_group_reference", description: "Edit group-reference offsets and mute, with fresh snapshot and dry-run.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},expectedSnapshot:{type:"string"},timeOffset:{type:"integer"},pitchOffset:{type:"integer"},mute:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot"]} },
+    { name: "get_retakes", description: "Read note retake count and IDs generated and tracked by this MCP, plus edit snapshot.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},noteIndex:{type:"integer",minimum:0}},required:["noteIndex"]} },
+    { name: "edit_retakes", description: "Generate, activate or delete an MCP-tracked retake; use latest snapshot, dry-run, and acknowledge shared groups.", inputSchema: {type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},noteIndex:{type:"integer"},expectedSnapshot:{type:"string"},operation:{type:"string",enum:["generate","activate","delete"]},takeId:{type:"integer"},newDuration:{type:"boolean"},newPitch:{type:"boolean"},newTimbre:{type:"boolean"},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["noteIndex","expectedSnapshot","operation"]} },
+    {name:"get_project_structure",description:"Read track and group structure and a snapshot for guarded edits.",inputSchema:{type:"object",properties:{}}},
+    {name:"edit_project_structure",description:"Create/delete tracks and unreferenced library groups, or add/delete group references; dry-run and fresh structure snapshot required. Does not clone tracks or select voices.",inputSchema:{type:"object",properties:{expectedSnapshot:{type:"string"},operation:{type:"string",enum:["add_track","delete_track","add_group","delete_group","add_reference","delete_reference"]},trackIndex:{type:"integer"},groupIndex:{type:"integer"},groupUUID:{type:"string"},name:{type:"string"},timeOffset:{type:"integer"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot","operation"]}},
+    {name:"get_time_axis",description:"Read tempo and meter marks and a snapshot for guarded edits.",inputSchema:{type:"object",properties:{}}},
+    {name:"edit_time_axis",description:"Add/update/delete one tempo or meter mark using a fresh snapshot and dry-run; meter positions are measure numbers.",inputSchema:{type:"object",properties:{expectedSnapshot:{type:"string"},operation:{type:"string",enum:["set_tempo","delete_tempo","set_meter","delete_meter"]},position:{type:"integer",minimum:0},bpm:{type:"number"},numerator:{type:"integer"},denominator:{type:"integer"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot","operation","position"]}},
+    {name:"get_editor_view",description:"Read the current piano-roll view bounds and scaling.",inputSchema:{type:"object",properties:{}}},
+    {name:"set_editor_view",description:"Move or scale the piano-roll view; dry-run by default.",inputSchema:{type:"object",properties:{left:{type:"number"},right:{type:"number"},scale:{type:"number"},centerPitch:{type:"number"},dry_run:{type:"boolean",default:true}}}},
+    {name:"set_note_selection",description:"Select notes in the current piano-roll group. Requires current group UUID; dry-run by default.",inputSchema:{type:"object",properties:{expectedGroupUUID:{type:"string"},mode:{type:"string",enum:["replace","add","remove","clear"]},noteIndices:{type:"array",items:{type:"integer",minimum:0}},dry_run:{type:"boolean",default:true}},required:["expectedGroupUUID","mode"]}},
+    {name:"convert_pitch",description:"Convert MIDI semitones and frequency in hertz.",inputSchema:{type:"object",properties:{unit:{type:"string",enum:["midi","hz"]},value:{type:"number"}},required:["unit","value"]}},
+    {name:"get_phrase_context",description:"Read a bounded phrase and optionally sample each note's computed onset pitch; positions are group-local blicks.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},start:{type:"integer",minimum:0},end:{type:"integer",minimum:1},limit:{type:"integer",minimum:1,maximum:128,default:64},includePitch:{type:"boolean",default:false}},required:["start","end"]}},
+    {name:"transform_notes",description:"Transpose, shift, or scale duration of up to 60 existing notes using a fresh group snapshot; shared groups require acknowledgement and dry-run is default.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},expectedSnapshot:{type:"string"},noteIndices:{type:"array",items:{type:"integer",minimum:0},minItems:1,maxItems:60},pitchOffset:{type:"integer"},onsetOffset:{type:"integer"},durationScale:{type:"number"},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot","noteIndices"]}},
+    {name:"inspect_musicxml",description:"Inspect a local score-partwise MusicXML or MXL file, return SHA-256, lanes, overlap warnings and a bounded preview without modifying SynthV.",inputSchema:{type:"object",properties:{path:{type:"string"},previewLimit:{type:"integer",minimum:0,maximum:100,default:12}},required:["path"]}},
+    {name:"get_host_info",description:"Read SynthV host version, platform and UI language.",inputSchema:{type:"object",properties:{}}},
+    {name:"get_selection_details",description:"Read selected notes, groups, pitch controls and optionally automation point positions.",inputSchema:{type:"object",properties:{paramName:{type:"string"}}}},
+    {name:"set_editor_objects",description:"Change selected group references or pitch controls for the current editor; dry-run by default.",inputSchema:{type:"object",properties:{expectedGroupUUID:{type:"string"},kind:{type:"string",enum:["group","pitch_control"]},mode:{type:"string",enum:["replace","add","remove","clear"]},indices:{type:"array",items:{type:"integer",minimum:0}},dry_run:{type:"boolean",default:true}},required:["expectedGroupUUID","kind","mode"]}},
+    {name:"convert_editor_coordinates",description:"Convert editor time, pitch, screen coordinates, or snap time according to the current grid.",inputSchema:{type:"object",properties:{direction:{type:"string",enum:["time_to_x","x_to_time","pitch_to_y","y_to_pitch","snap_time"]},value:{type:"number"}},required:["direction","value"]}},
+    {name:"get_automation_state",description:"Read parameter definition and all control points, returning a snapshot for guarded edits.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},paramName:{type:"string"}},required:["paramName"]}},
+    {name:"edit_automation",description:"Safely add, remove, replace or simplify automation points using a fresh snapshot; dry-run and shared-group checks apply.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},paramName:{type:"string"},expectedSnapshot:{type:"string"},mode:{type:"string",enum:["add","remove_range","replace_range","simplify"]},start:{type:"integer"},end:{type:"integer"},points:{type:"array",items:{type:"array",items:{type:"number"},minItems:2,maxItems:2}},threshold:{type:"number"},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["paramName","expectedSnapshot","mode"]}},
+    {name:"get_voice_snapshot",description:"Read a group's voice parameters and guarded snapshot. SynthV does not expose the singer identity.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"}}}},
+    {name:"copy_voice_settings",description:"Copy available group voice parameters and vocal mode settings with source/target snapshots; does not copy or select a singer. Defaults to dry-run.",inputSchema:{type:"object",properties:{sourceTrack:{type:"integer"},sourceGroup:{type:"integer"},targetTrack:{type:"integer"},targetGroup:{type:"integer"},expectedSource:{type:"string"},expectedTarget:{type:"string"},dry_run:{type:"boolean",default:true}},required:["sourceTrack","sourceGroup","targetTrack","targetGroup","expectedSource","expectedTarget"]}},
+    {name:"apply_expression_preset",description:"Apply an explicit scoop, falloff, vibrato, crescendo or breathiness curve in a bounded range, using a fresh automation snapshot; dry-run by default.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},preset:{type:"string",enum:["scoop","falloff","vibrato","crescendo","breathiness"]},start:{type:"integer"},end:{type:"integer"},amount:{type:"number"},cycles:{type:"integer"},expectedSnapshot:{type:"string"},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["preset","start","end","amount","expectedSnapshot"]}},
+    {name:"humanize_notes",description:"Apply deterministic, bounded timing/duration variation to up to 60 guarded notes; optional chord alignment and dry-run by default.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},expectedSnapshot:{type:"string"},noteIndices:{type:"array",items:{type:"integer",minimum:0}},seed:{type:"integer"},onsetJitter:{type:"integer"},durationJitter:{type:"integer"},preserveChords:{type:"boolean",default:true},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot","noteIndices","seed","onsetJitter","durationJitter"]}},
+    {name:"fit_lyrics",description:"Apply explicit syllable and optional formal phoneme assignments to up to 60 guarded notes; this does not infer pronunciation. Use MusicXML workflow for choir scores.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},expectedSnapshot:{type:"string"},assignments:{type:"array",items:{type:"object",properties:{noteIndex:{type:"integer"},lyrics:{type:"string"},phonemes:{type:"string"}},required:["noteIndex","lyrics"]}},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot","assignments"]}},
+    {name:"host_clipboard",description:"Read or write SynthV host text clipboard. Clipboard writes default to dry-run.",inputSchema:{type:"object",properties:{operation:{type:"string",enum:["read","write"]},text:{type:"string"},dry_run:{type:"boolean",default:true}},required:["operation"]}},
+    {name:"edit_voice_settings",description:"Update explicit voice and vocal mode parameters using a fresh voice snapshot. Does not select or identify the singer; defaults to dry-run.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},expectedSnapshot:{type:"string"},voice:{type:"object"},dry_run:{type:"boolean",default:true}},required:["expectedSnapshot","voice"]}},
+    {name:"inspect_midi",description:"Read-only inspection of a local MIDI format 0 or 1 file, with note counts, channels, SHA-256 and bounded preview.",inputSchema:{type:"object",properties:{path:{type:"string"},previewLimit:{type:"integer",minimum:0,maximum:100,default:12}},required:["path"]}},
+    {name:"import_score_lane",description:"Import one explicitly selected monophonic MusicXML/MXL or MIDI lane in bounded chunks. Requires source hash and fresh target snapshot. For choir use the standard MusicXML import workflow.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},path:{type:"string"},sourceSha256:{type:"string"},partId:{type:"string"},voice:{type:"string"},staff:{type:"string"},midiTrack:{type:"integer"},midiChannel:{type:"integer"},startIndex:{type:"integer"},limit:{type:"integer",maximum:60},defaultLyric:{type:"string"},expectedSnapshot:{type:"string"},allowSharedGroup:{type:"boolean"},dry_run:{type:"boolean",default:true}},required:["path","sourceSha256","expectedSnapshot"]}},
+    {name:"script_data",description:"Read or edit namespaced scalar SV-MCP user metadata on a project, track, group reference, group or note. Writes require a fresh snapshot and default to dry-run.",inputSchema:{type:"object",properties:{trackIndex:{type:"integer"},groupIndex:{type:"integer"},noteIndex:{type:"integer"},object:{type:"string",enum:["project","track","group_reference","group","note"]},key:{type:"string"},operation:{type:"string",enum:["read","set","remove"]},value:{},expectedSnapshot:{type:"string"},dry_run:{type:"boolean",default:true}},required:["object","key","operation"]}},
+    {name:"show_dialog",description:"Show an asynchronous SynthV dialog and return a dialog ID; defaults to dry-run. Use get_dialog_result to check the response.",inputSchema:{type:"object",properties:{kind:{type:"string",enum:["message","input","ok_cancel","yes_no_cancel"]},title:{type:"string"},message:{type:"string"},defaultText:{type:"string"},dry_run:{type:"boolean",default:true}},required:["kind","title","message"]}},
+    {name:"get_dialog_result",description:"Read the result of a dialog opened during this MCP handler session.",inputSchema:{type:"object",properties:{dialogId:{type:"integer"}},required:["dialogId"]}},
+    {name:"set_automation_selection",description:"Change selected automation points in the current group, using group-local blick positions and dry-run by default.",inputSchema:{type:"object",properties:{expectedGroupUUID:{type:"string"},paramName:{type:"string"},mode:{type:"string",enum:["replace","add","remove","clear"]},positions:{type:"array",items:{type:"integer",minimum:0}},dry_run:{type:"boolean",default:true}},required:["expectedGroupUUID","paramName","mode"]}},
     // 8. Playback Controls
     {
       name: "play",
@@ -488,7 +552,7 @@ export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()):
     // 9. Batch Operations
     {
       name: "batch_edit",
-      description: "Execute multiple note/phoneme/voice/parameter operations in a single atomic transaction with snapshot rollback.",
+      description: "Execute note/phoneme/voice/parameter operations sequentially. A failed batch may leave earlier operations applied; use SynthV Undo as needed. Dry-run is recommended.",
       inputSchema: {
         type: "object",
         properties: {
@@ -728,6 +792,219 @@ export function createSynthesizerVMcpServer(ipc: MailboxIPC = new MailboxIPC()):
           break;
         }
 
+        case "get_computed_pitch": {
+          const args = schemas.GetComputedPitchSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_computed_pitch", args, 30_000);
+          break;
+        }
+        case "get_pitch_controls": {
+          const args = schemas.GetPitchControlsSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_pitch_controls", args);
+          break;
+        }
+        case "edit_pitch_control": {
+          const args = schemas.EditPitchControlSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_pitch_control", args);
+          break;
+        }
+        case "get_editor_context": {
+          const args = schemas.EditorContextSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_editor_context", args);
+          break;
+        }
+        case "convert_time": {
+          const args = schemas.ConvertTimeSchema.parse(rawArgs || {});
+          result = await ipc.execute("convert_time", args);
+          break;
+        }
+        case "sample_parameter": {
+          const args = schemas.SampleParameterSchema.parse(rawArgs || {});
+          result = await ipc.execute("sample_parameter", args);
+          break;
+        }
+        case "get_track_state": {
+          const args = schemas.GetTrackStateSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_track_state", args);
+          break;
+        }
+        case "edit_track_state": {
+          const args = schemas.EditTrackStateSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_track_state", args);
+          break;
+        }
+        case "get_group_reference": {
+          const args = schemas.GetGroupReferenceSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_group_reference", args);
+          break;
+        }
+        case "edit_group_reference": {
+          const args = schemas.EditGroupReferenceSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_group_reference", args);
+          break;
+        }
+        case "get_retakes": {
+          const args = schemas.GetRetakesSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_retakes", args);
+          break;
+        }
+        case "edit_retakes": {
+          const args = schemas.EditRetakesSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_retakes", args);
+          break;
+        }
+        case "get_project_structure": {
+          const args = schemas.ProjectStructureSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_project_structure", args);
+          break;
+        }
+        case "edit_project_structure": {
+          const args = schemas.EditStructureSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_project_structure", args);
+          break;
+        }
+        case "get_time_axis": {
+          const args = schemas.ProjectStructureSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_time_axis", args);
+          break;
+        }
+        case "edit_time_axis": {
+          const args = schemas.EditTimeAxisSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_time_axis", args);
+          break;
+        }
+        case "get_editor_view": {
+          const args = schemas.EditorViewSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_editor_view", args);
+          break;
+        }
+        case "set_editor_view": {
+          const args = schemas.SetEditorViewSchema.parse(rawArgs || {});
+          result = await ipc.execute("set_editor_view", args);
+          break;
+        }
+        case "set_note_selection": {
+          const args = schemas.SetNoteSelectionSchema.parse(rawArgs || {});
+          result = await ipc.execute("set_note_selection", args);
+          break;
+        }
+        case "convert_pitch": {
+          const args = schemas.ConvertPitchSchema.parse(rawArgs || {});
+          result = await ipc.execute("convert_pitch", args);
+          break;
+        }
+        case "get_phrase_context": {
+          const args = schemas.GetPhraseContextSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_phrase_context", args, 30_000);
+          break;
+        }
+        case "transform_notes": {
+          const args = schemas.TransformNotesSchema.parse(rawArgs || {});
+          result = await ipc.execute("transform_notes", args, 30_000);
+          break;
+        }
+        case "inspect_musicxml": {
+          const args = schemas.InspectMusicXmlSchema.parse(rawArgs || {});
+          result = await inspectMusicXml(args.path, args.previewLimit);
+          break;
+        }
+        case "get_host_info": {
+          const args = schemas.ProjectStructureSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_host_info", args);
+          break;
+        }
+        case "get_selection_details": {
+          const args = schemas.SelectionDetailsSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_selection_details", args);
+          break;
+        }
+        case "set_editor_objects": {
+          const args = schemas.SetEditorObjectsSchema.parse(rawArgs || {});
+          result = await ipc.execute("set_editor_objects", args);
+          break;
+        }
+        case "convert_editor_coordinates": {
+          const args = schemas.ConvertCoordinatesSchema.parse(rawArgs || {});
+          result = await ipc.execute("convert_editor_coordinates", args);
+          break;
+        }
+        case "get_automation_state": {
+          const args = schemas.AutomationStateSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_automation_state", args, 30000);
+          break;
+        }
+        case "edit_automation": {
+          const args = schemas.EditAutomationSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_automation", args, 30000);
+          break;
+        }
+        case "get_voice_snapshot": {
+          const args = schemas.GetGroupReferenceSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_voice_snapshot", args);
+          break;
+        }
+        case "copy_voice_settings": {
+          const args = schemas.CopyVoiceSchema.parse(rawArgs || {});
+          result = await ipc.execute("copy_voice_settings", args);
+          break;
+        }
+        case "apply_expression_preset": {
+          const args = schemas.ExpressionPresetSchema.parse(rawArgs || {});
+          const plan = expressionPoints(args.preset, args.start, args.end, args.amount, args.cycles);
+          result = await ipc.execute("edit_automation", {trackIndex:args.trackIndex, groupIndex:args.groupIndex, paramName:plan.paramName, expectedSnapshot:args.expectedSnapshot, mode:"replace_range", start:args.start, end:args.end, points:plan.points, allowSharedGroup:args.allowSharedGroup, dry_run:args.dry_run}, 30000);
+          break;
+        }
+        case "humanize_notes": {
+          const args = schemas.HumanizeNotesSchema.parse(rawArgs || {});
+          result = await ipc.execute("humanize_notes", args, 30000);
+          break;
+        }
+        case "fit_lyrics": {
+          const args = schemas.FitLyricsSchema.parse(rawArgs || {});
+          result = await ipc.execute("fit_lyrics", args, 30000);
+          break;
+        }
+        case "host_clipboard": {
+          const args = schemas.HostClipboardSchema.parse(rawArgs || {});
+          result = await ipc.execute("host_clipboard", args);
+          break;
+        }
+        case "edit_voice_settings": {
+          const args = schemas.EditVoiceSettingsSchema.parse(rawArgs || {});
+          result = await ipc.execute("edit_voice_settings", args);
+          break;
+        }
+        case "inspect_midi": {
+          const args = schemas.InspectMusicXmlSchema.parse(rawArgs || {});
+          result = await inspectMidi(args.path, args.previewLimit);
+          break;
+        }
+        case "import_score_lane": {
+          const args = schemas.ImportScoreLaneSchema.parse(rawArgs || {});
+          const lane = await prepareLane(args);
+          const applied = await ipc.execute("import_score_notes", {trackIndex:args.trackIndex,groupIndex:args.groupIndex,expectedSnapshot:args.expectedSnapshot,allowSharedGroup:args.allowSharedGroup,dry_run:args.dry_run,notes:lane.notes},30000);
+          result = {sourceSha256:lane.sha256,total:lane.total,startIndex:lane.startIndex,nextIndex:lane.nextIndex, ...applied};
+          break;
+        }
+        case "script_data": {
+          const args = schemas.ScriptDataSchema.parse(rawArgs || {});
+          result = await ipc.execute("script_data", args);
+          break;
+        }
+        case "show_dialog": {
+          const args = schemas.DialogSchema.parse(rawArgs || {});
+          result = await ipc.execute("show_dialog", args);
+          break;
+        }
+        case "get_dialog_result": {
+          const args = schemas.DialogResultSchema.parse(rawArgs || {});
+          result = await ipc.execute("get_dialog_result", args);
+          break;
+        }
+        case "set_automation_selection": {
+          const args = schemas.SetAutomationSelectionSchema.parse(rawArgs || {});
+          result = await ipc.execute("set_automation_selection", args);
+          break;
+        }
         case "play": {
           schemas.PlaySchema.parse(rawArgs || {});
           result = await ipc.execute("play", {});

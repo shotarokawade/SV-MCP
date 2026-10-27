@@ -91,3 +91,66 @@ describe("MCP Tool Schemas", () => {
     }).success).toBe(true);
   });
 });
+
+describe("SynthV 2 pitch schemas", () => {
+  it("limits computed pitch samples and requires positive intervals", () => {
+    expect(schemas.GetComputedPitchSchema.safeParse({ start: 0, interval: 100, frames: 10000 }).success).toBe(true);
+    expect(schemas.GetComputedPitchSchema.safeParse({ start: 0, interval: 0, frames: 1 }).success).toBe(false);
+    expect(schemas.GetComputedPitchSchema.safeParse({ start: 0, interval: 1, frames: 10001 }).success).toBe(false);
+  });
+  it("requires a fresh snapshot and defaults editing to dry-run", () => {
+    const edit = schemas.EditPitchControlSchema.parse({ expectedSnapshot: "snapshot", operation: "add", type: "point", position: 0, pitch: 60 });
+    expect(edit.dry_run).toBe(true);
+    expect(edit.allowSharedGroup).toBe(false);
+    expect(schemas.EditPitchControlSchema.safeParse({ operation: "delete", index: 0 }).success).toBe(false);
+    expect(schemas.EditPitchControlSchema.safeParse({ expectedSnapshot: "x", operation: "update" }).success).toBe(false);
+  });
+  it("rejects incomplete curves and non-increasing times", () => {
+    const curve = { expectedSnapshot: "x", operation: "add", type: "curve", position: 100, pitch: 60 };
+    expect(schemas.EditPitchControlSchema.safeParse(curve).success).toBe(false);
+    expect(schemas.EditPitchControlSchema.safeParse({ ...curve, points: [[0, 0], [0, 1]] }).success).toBe(false);
+    expect(schemas.EditPitchControlSchema.safeParse({ ...curve, points: [[-10, 0], [10, 0.5]] }).success).toBe(true);
+  });
+});
+
+describe("SynthV 2 native operation schemas", () => {
+  it("requires guarded and explicit retake changes", () => {
+    expect(schemas.EditRetakesSchema.safeParse({noteIndex:0,expectedSnapshot:"x",operation:"generate"}).success).toBe(false);
+    const retake = schemas.EditRetakesSchema.parse({noteIndex:0,expectedSnapshot:"x",operation:"generate",newPitch:true});
+    expect(retake.dry_run).toBe(true);
+    expect(schemas.EditRetakesSchema.safeParse({noteIndex:0,expectedSnapshot:"x",operation:"delete",takeId:0}).success).toBe(false);
+  });
+  it("validates track settings and group-reference edits", () => {
+    expect(schemas.EditTrackStateSchema.safeParse({expectedSnapshot:"x",pan:2}).success).toBe(false);
+    expect(schemas.EditTrackStateSchema.parse({expectedSnapshot:"x",solo:false}).dry_run).toBe(true);
+    expect(schemas.EditGroupReferenceSchema.safeParse({expectedSnapshot:"x"}).success).toBe(false);
+  });
+  it("protects main groups and initial tempo/meter marks", () => {
+    expect(schemas.EditStructureSchema.safeParse({expectedSnapshot:"x",operation:"delete_reference",trackIndex:0,groupIndex:0}).success).toBe(false);
+    expect(schemas.EditTimeAxisSchema.safeParse({expectedSnapshot:"x",operation:"delete_tempo",position:0}).success).toBe(false);
+    expect(schemas.EditTimeAxisSchema.parse({expectedSnapshot:"x",operation:"set_tempo",position:0,bpm:100}).dry_run).toBe(true);
+  });
+});
+
+describe("note transform safety", () => {
+  it("requires unique notes and defaults to preview", () => {
+    const base = {expectedSnapshot:"x",noteIndices:[0,1],pitchOffset:2};
+    expect(schemas.TransformNotesSchema.parse(base).dry_run).toBe(true);
+    expect(schemas.TransformNotesSchema.safeParse({...base,noteIndices:[1,1]}).success).toBe(false);
+    expect(schemas.TransformNotesSchema.safeParse({...base,durationScale:0}).success).toBe(false);
+    expect(schemas.TransformNotesSchema.safeParse({...base,pitchOffset:0}).success).toBe(false);
+  });
+});
+
+describe("guarded automation and expression", () => {
+  it("validates automation ranges and guards", () => {
+    const v={paramName:"loudness",expectedSnapshot:"x",mode:"replace_range",start:0,end:100,points:[[0,0],[100,2]]};
+    expect(schemas.EditAutomationSchema.parse(v).dry_run).toBe(true);
+    expect(schemas.EditAutomationSchema.safeParse({...v,points:[[101,2]]}).success).toBe(false);
+    expect(schemas.EditAutomationSchema.safeParse({...v,points:[[0,1],[0,2]]}).success).toBe(false);
+  });
+  it("validates guarded humanization and explicit syllables", () => {
+    expect(schemas.HumanizeNotesSchema.safeParse({expectedSnapshot:"x",noteIndices:[0],seed:1,onsetJitter:0,durationJitter:0}).success).toBe(false);
+    expect(schemas.FitLyricsSchema.parse({expectedSnapshot:"x",assignments:[{noteIndex:0,lyrics:"a"}]}).dry_run).toBe(true);
+  });
+});

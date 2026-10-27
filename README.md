@@ -30,7 +30,7 @@ Synthesizer V Studio 2 Pro executes scripts within an embedded Lua 5.4 / Duktape
 |  `StartMCPServerRequestHandler.lua`  |
 |  - Non-blocking SV:setTimeout loop   |
 |  - Dreamtonics Official Scripting API|
-|  - Automatic Snapshot Rollback & Undo|
+|  - In-app Undo records|
 +--------------------------------------+
 ```
 
@@ -125,11 +125,14 @@ Or manually copy the files in `sv-scripts/` to your Synthesizer V Studio scripts
 | `get_singing_project_snapshot` | Reads every track/group/note with group offsets, project-absolute onset, visible lyrics, direct phonemes, and computed phonemes in one call. |
 | `begin_fresh_musicxml_choir_job` | Starts a verifiable from-scratch MusicXML choir job, rejects a pre-existing output path, and records the source hash and baseline project fingerprint. |
 | `audit_musicxml_lyrics` | Compares an entire MusicXML authority against the active SynthV project and returns a deterministic pass/fail plus every structural, lyric, phoneme, `sil`, and placeholder defect. |
-| `repair_musicxml_lyrics` | Dry-runs or atomically applies the complete MusicXML-derived pronunciation plan, rejects stale audits/structural mismatches, and returns a post-repair audit. |
+| `repair_musicxml_lyrics` | Dry-runs or applies the complete MusicXML-derived pronunciation plan, rejects stale audits/structural mismatches, and returns a post-repair audit. |
 | `get_note_attributes` | Gets note attributes (detune, languageOverride, phonesetOverride, musicalType, rapAccent, per-phoneme timing/strength). |
 | `set_note_attributes` | Modifies note attributes and per-phoneme attributes (`phonemes: [{ leftOffset, position, activity, strength }]`). |
 | `get_voice` | Gets voice parameters on `NoteGroupReference` (loudness, tension, breathiness, gender, toneShift, vocalModeParams). |
 | `set_voice` | Modifies track/group voice parameters and vocal modes. |
+| `get_computed_pitch` | Samples SynthV's computed pitch in MIDI semitones at project-absolute blick positions (Studio 2.1.1+). |
+| `get_pitch_controls` | Reads Smart Pitch points/curves, group offsets, reference count, and an edit snapshot (Studio 2.1+). |
+| `edit_pitch_control` | Adds, updates or deletes one point/curve with a fresh snapshot; defaults to dry-run and checks shared groups. |
 | `get_parameters` | Reads automation curve points for parameters (`pitchDelta`, `loudness`, `tension`, `breathiness`, `voicing`, `gender`, `vocalMode_*`). |
 | `set_parameters` | Adds, replaces, or removes automation points with range validation. |
 | `play` | Starts playback transport. |
@@ -138,9 +141,30 @@ Or manually copy the files in `sv-scripts/` to your Synthesizer V Studio scripts
 | `seek` | Moves playhead to position in seconds. |
 | `get_playhead` | Reads playhead position and status (`"playing"`, `"looping"`, `"stopped"`). |
 | `loop` | Sets loop playback region between `tBegin` and `tEnd` in seconds. |
-| `batch_edit` | Executes multiple operations atomically in a single undo transaction with pre-validation and diff preview. |
+| `batch_edit` | Executes operations sequentially. A failure may leave prior operations applied; SynthV Undo may be needed multiple times. |
 
 ---
+
+For a feature-by-feature comparison and remaining gaps, see [Agent Bridge coverage](docs/agent-bridge-coverage.md).
+
+## Native SynthV 2 editing tools
+
+The existing MCP handler also provides `get_phrase_context`, `get_editor_context`, `get_editor_view`, `set_editor_view`, `set_note_selection`, `convert_pitch`, `convert_time`, `sample_parameter`, `get_track_state` / `edit_track_state`, `get_group_reference` / `edit_group_reference`, `get_retakes` / `edit_retakes`, `get_project_structure` / `edit_project_structure`, and `get_time_axis` / `edit_time_axis`. All project indices are zero-based. Mutations default to dry-run, and project edits require the fresh snapshot from the corresponding read. Check shared-group reference counts before modifying shared note content. On a mutation failure after an undo record is created, use SynthV Undo and re-read before retrying.
+
+Retake IDs are not enumerable through the public API. The server tracks IDs it generates in note retake script data; only these IDs and default ID 0 can be activated, and only tracked non-default IDs can be deleted. External edits that change the take count invalidate the tracked list. Counts alone cannot detect every replacement of retakes, so re-evaluate after manual changes. The generated vocal and active take cannot be confirmed by the ID alone; audition it.
+
+Structure snapshots cover the fields reported in `snapshotScope`, not all voice, automation, or note attributes. They are not a full project backup. Track/group clone and harmony creation are intentionally unavailable because of reported SynthV 2.2.1 crashes; new tracks do not select a voice. Keep the original project and verify changes in a working copy. These tools use the existing handler; no second bridge is required.
+
+## SynthV 2 pitch inspection and editing
+
+1. Read `get_pitch_controls` for the target track and group. Track, group and control indices are zero-based. Control positions are **group-local blicks**; control pitch is relative to the group pitch offset. A curve's point pairs are offsets from its anchor position and pitch.
+2. Use `get_computed_pitch` with project-absolute `start`, positive `interval`, and `frames` (maximum 10,000). Values are MIDI semitones. Compare `framesReturned` and `ready`, and allow rendering to finish before interpreting a result.
+3. Submit `edit_pitch_control` with the returned `snapshot` as `expectedSnapshot`; `dry_run` defaults to true. Inspect its preview, then use `dry_run: false` to apply. Re-read after every edit and re-sample the generated pitch; audition the affected phrase and choir mix.
+4. Edits operate on the underlying group, so groups with multiple references require `allowSharedGroup: true` after checking the impact. An unexpected mutation error requires one SynthV Undo. This operation is not part of `batch_edit` and does not promise automatic rollback.
+
+The snapshot checks the project path, target UUID and offsets, note timing/pitch/lyrics/phonemes, control data, and reference count. It does not cover every voice, expression, tempo or automation setting. Re-read and re-evaluate the target after such changes. Host readback does not establish musical quality or prove that rendering is complete. Empty arrays can be encoded as `{}` by the existing Lua JSON serializer; use the accompanying counts.
+
+The pitch feature was independently implemented against the [Dreamtonics scripting API](https://resource.dreamtonics.com/scripting/).
 
 ## Phoneme Manipulation & German Multi-syllabic Lyrics Fix
 
@@ -220,14 +244,14 @@ Using this MCP server, the LLM sets lyrics and phonemes directly via official AP
 
 ---
 
-## Safety, Dry Run, and Rollback Guarantees
+## Safety and Dry Run
 
 1. **`dry_run: true`**:
    All mutation tools support `dry_run: true`. The server returns the predicted changes and diff without modifying project state.
-2. **One-Step In-App Undo (`project.newUndoRecord()`)**:
-   Every mutating MCP operation registers a project undo record. The user can press `Cmd+Z` / `Ctrl+Z` inside Synthesizer V Studio to instantly revert the entire operation.
-3. **Transaction Rollback in Batch**:
-   If an error occurs during `batch_edit`, the script captures the pre-mutation state and automatically rolls back modified items before returning the error.
+2. **In-App Undo (`project.newUndoRecord()`)**:
+   Mutations create SynthV undo records. `batch_edit` calls individual handlers that can each create their own undo record; do not assume one Undo reverses the whole batch.
+3. **Batch failures**:
+   `batch_edit` runs operations sequentially and does not automatically roll back earlier operations when a later step fails. Inspect the project and use SynthV Undo as needed before retrying.
 4. **Boundary & Range Validation**:
    - MIDI pitch: `0` - `127`
    - Loudness: `-48` dB to `+12` dB

@@ -866,6 +866,833 @@ handlers.get_computed_phonemes = function(params)
   }
 end
 
+-- Pitch operations use the public SynthV 2 scripting API. Positions returned by
+-- control objects are group-local; computed pitch sampling uses project time.
+local function read_pitch_state(project, groupRef, group)
+  local controls, parts = {}, {group:getUUID(), project:getFileName() or "", tostring(groupRef:getTimeOffset()), tostring(groupRef:getPitchOffset())}
+  local count = group:getNumPitchControls()
+  for i = 1, count do
+    local control = group:getPitchControl(i)
+    local hasPoints, points = pcall(function() return control:getPoints() end)
+    if not hasPoints then points = nil end
+    local item = {index = i - 1, type = hasPoints and "curve" or "point", position = control:getPosition(), pitch = control:getPitch()}
+    if hasPoints then item.points = points end
+    controls[#controls + 1] = item
+    parts[#parts + 1] = json.stringify({item.type, item.position, item.pitch, points or ""})
+  end
+  for i = 1, group:getNumNotes() do
+    local n = group:getNote(i)
+    parts[#parts + 1] = json.stringify({n:getOnset(), n:getDuration(), n:getPitch(), n:getDetune() or 0, n:getLyrics() or "", n:getPhonemes() or ""})
+  end
+  local refs = 0
+  for t = 1, project:getNumTracks() do
+    local track = project:getTrack(t)
+    for g = 1, track:getNumGroups() do
+      local ref = track:getGroupReference(g)
+      local target = ref:getTarget()
+      if target and target:getUUID() == group:getUUID() then refs = refs + 1 end
+    end
+  end
+  parts[#parts + 1] = tostring(refs)
+  return {groupUUID = group:getUUID(), timeOffset = groupRef:getTimeOffset(), pitchOffset = groupRef:getPitchOffset(), referenceCount = refs,
+    controlCount = count, controls = controls, snapshot = table.concat(parts, "|"), snapshotScope = "project path, group UUID, offsets, note timing/pitch/lyrics/phonemes, pitch controls and reference count"}
+end
+
+handlers.get_computed_pitch = function(params)
+  local project, track, groupRef, group = resolve_target_group(params)
+  if not SV.getComputedPitchForGroup then error("UNSUPPORTED_HOST_CAPABILITY: computed pitch requires SynthV 2.1.1+") end
+  local values = SV:getComputedPitchForGroup(groupRef, params.start, params.interval, params.frames)
+  return {start = params.start, interval = params.interval, framesRequested = params.frames, framesReturned = values and #values or 0,
+    ready = values ~= nil and #values == params.frames, values = values or {}, units = "MIDI semitones", positionUnits = "project-absolute blicks", timeOffset = groupRef:getTimeOffset()}
+end
+
+handlers.get_pitch_controls = function(params)
+  local project, track, groupRef, group = resolve_target_group(params)
+  return read_pitch_state(project, groupRef, group)
+end
+
+handlers.edit_pitch_control = function(params)
+  local project, track, groupRef, group = resolve_target_group(params)
+  local before = read_pitch_state(project, groupRef, group)
+  if params.expectedSnapshot ~= before.snapshot then error("STALE_PITCH_SNAPSHOT: re-read pitch controls") end
+  if before.referenceCount > 1 and not params.allowSharedGroup then error("SHARED_GROUP: editing affects all references; explicitly acknowledge") end
+  local existing = nil
+  if params.operation ~= "add" then
+    if not params.index or params.index < 0 or params.index >= before.controlCount then error("Pitch control index out of range") end
+    existing = before.controls[params.index + 1]
+    if params.points and existing.type ~= "curve" then error("Cannot set curve points on a point") end
+    if params.type and params.type ~= existing.type then error("Cannot change control type with update") end
+  end
+  local preview = {operation = params.operation, before = existing, requested = {type = params.type, position = params.position, pitch = params.pitch, points = params.points}, groupUUID = before.groupUUID, referenceCount = before.referenceCount}
+  if params.dry_run ~= false then return {success = true, dry_run = true, preview = preview} end
+  -- Construct and validate detached objects before touching the project.
+  local control
+  if params.operation == "add" then
+    control = SV:create(params.type == "curve" and "PitchControlCurve" or "PitchControlPoint")
+    control:setPosition(params.position)
+    control:setPitch(params.pitch)
+    if params.points then control:setPoints(params.points) end
+  elseif params.operation == "update" then
+    control = group:getPitchControl(params.index + 1)
+  end
+  project:newUndoRecord()
+  local ok, err = pcall(function()
+    if params.operation == "add" then group:addPitchControl(control)
+    elseif params.operation == "delete" then group:removePitchControl(params.index + 1)
+    else
+      if params.pitch ~= nil then control:setPitch(params.pitch) end
+      if params.points ~= nil then control:setPoints(params.points) end
+      if params.position ~= nil then control:setPosition(params.position) end
+    end
+  end)
+  if not ok then error("PITCH_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  return {success = true, dry_run = false, preview = preview, after = read_pitch_state(project, groupRef, group), verification = "readback only; inspect and audition generated pitch"}
+end
+
+-- Native SV 2 operations, implemented using Dreamtonics' public API.
+handlers.get_editor_context = function(params)
+  local editor = SV:getMainEditor()
+  if not editor then error("Editor unavailable") end
+  local track, ref, selection = editor:getCurrentTrack(), editor:getCurrentGroup(), editor:getSelection()
+  local notes = {}
+  if selection then
+    for _, note in ipairs(selection:getSelectedNotes() or {}) do
+      notes[#notes + 1] = {index = note:getIndexInParent() - 1, onset = note:getOnset(), pitch = note:getPitch()}
+    end
+  end
+  return {trackIndex = track and track:getIndexInParent() - 1 or nil,
+    groupIndex = ref and ref:getIndexInParent() - 1 or nil,
+    groupUUID = ref and ref:getTarget():getUUID() or nil, selectedNoteCount = #notes, selectedNotes = notes}
+end
+
+handlers.convert_time = function(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  local axis = project:getTimeAxis()
+  local blick = params.unit == "seconds" and axis:getBlickFromSeconds(params.value) or
+    (params.unit == "quarter" and SV:quarter2Blick(params.value) or params.value)
+  return {blick = blick, quarter = SV:blick2Quarter(blick), seconds = axis:getSecondsFromBlick(blick)}
+end
+
+handlers.sample_parameter = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  local param = group:getParameter(params.paramName)
+  if not param then error("Parameter not found: " .. params.paramName) end
+  local samples = {}
+  for _, position in ipairs(params.positions) do samples[#samples + 1] = {position = position, value = param:get(position)} end
+  return {parameter = params.paramName, positionUnits = "group-local blicks", samples = samples}
+end
+
+local function read_track_state(project, track, index)
+  local mixer = track:getMixer()
+  if not mixer then error("Track mixer unavailable") end
+  local state = {index = index, name = track:getName(), color = track:getDisplayColor(), bounced = track:isBounced(),
+    gain = mixer:getGainDecibel(), pan = mixer:getPan(), mute = mixer:isMuted(), solo = mixer:isSolo(), numGroups = track:getNumGroups()}
+  local main = track:getGroupReference(1)
+  local target = main and main:getTarget()
+  state.mainGroupUUID = target and target:getUUID() or ""
+  state.snapshot = json.stringify({project:getFileName() or "", index, state.mainGroupUUID, state.name, state.color, state.bounced, state.gain, state.pan, state.mute, state.solo, state.numGroups})
+  return state
+end
+local function resolve_track(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  local index = (params.trackIndex or 0) + 1
+  if index < 1 or index > project:getNumTracks() then error("Track index out of range") end
+  return project, project:getTrack(index)
+end
+handlers.get_track_state = function(params)
+  local project, track = resolve_track(params)
+  return read_track_state(project, track, params.trackIndex or 0)
+end
+handlers.edit_track_state = function(params)
+  local project, track = resolve_track(params)
+  local before = read_track_state(project, track, params.trackIndex or 0)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_TRACK_SNAPSHOT: re-read track") end
+  local result = {success = true, dry_run = params.dry_run ~= false, before = before, requested = params}
+  if params.dry_run ~= false then return result end
+  local mixer = track:getMixer()
+  project:newUndoRecord()
+  local ok, err = pcall(function()
+    if params.name ~= nil then track:setName(params.name) end
+    if params.color ~= nil then
+      local color = params.color
+      if #color == 7 and color:sub(1,1) == "#" then color = "ff" .. color:sub(2) end
+      track:setDisplayColor(color)
+    end
+    if params.bounced ~= nil then track:setBounced(params.bounced) end
+    if params.gain ~= nil then mixer:setGainDecibel(params.gain) end
+    if params.pan ~= nil then mixer:setPan(params.pan) end
+    if params.mute ~= nil then mixer:setMuted(params.mute) end
+    if params.solo ~= nil then mixer:setSolo(params.solo) end
+  end)
+  if not ok then error("TRACK_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after = read_track_state(project, track, params.trackIndex or 0)
+  return result
+end
+
+local function read_reference_state(project, ref, group)
+  local state = {groupUUID = group:getUUID(), timeOffset = ref:getTimeOffset(), pitchOffset = ref:getPitchOffset(), mute = ref:isMuted(), isMain = ref:isMain()}
+  state.snapshot = json.stringify({project:getFileName() or "", state.groupUUID, state.timeOffset, state.pitchOffset, state.mute, state.isMain})
+  return state
+end
+handlers.get_group_reference = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  return read_reference_state(project, ref, group)
+end
+handlers.edit_group_reference = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  local before = read_reference_state(project, ref, group)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_REFERENCE_SNAPSHOT: re-read group reference") end
+  local result = {success = true, dry_run = params.dry_run ~= false, before = before, requested = params}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok, err = pcall(function()
+    if params.timeOffset ~= nil then ref:setTimeOffset(params.timeOffset) end
+    if params.pitchOffset ~= nil then ref:setPitchOffset(params.pitchOffset) end
+    if params.mute ~= nil then ref:setMuted(params.mute) end
+  end)
+  if not ok then error("REFERENCE_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after = read_reference_state(project, ref, group)
+  return result
+end
+
+local RETAKE_KEY = "sv-mcp.retake-ids.v1"
+local function read_retake_state(project, ref, group, noteIndex)
+  if noteIndex < 0 or noteIndex >= group:getNumNotes() then error("Note index out of range") end
+  local note = group:getNote(noteIndex + 1)
+  local retakes = note:getRetakes()
+  if not retakes then error("Retakes unavailable: SynthV 2.1.1+ required") end
+  local tracked = retakes:getScriptData(RETAKE_KEY) or {}
+  local count = retakes:getNumTakes()
+  local base = read_pitch_state(project, ref, group)
+  local state = {noteIndex = noteIndex, groupUUID = group:getUUID(), referenceCount = base.referenceCount, takeCount = count,
+    trackedTakeIds = tracked.ids or {}, trackedCount = tracked.count, activeTakeKnown = false}
+  state.snapshot = json.stringify({base.snapshot, noteIndex, count, json.stringify(state.trackedTakeIds), tracked.count or -1})
+  return state, retakes
+end
+handlers.get_retakes = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  return read_retake_state(project, ref, group, params.noteIndex)
+end
+handlers.edit_retakes = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  local before, retakes = read_retake_state(project, ref, group, params.noteIndex)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_RETAKE_SNAPSHOT: re-read retakes") end
+  if before.referenceCount > 1 and not params.allowSharedGroup then error("SHARED_GROUP: retake edit affects all references") end
+  if params.operation ~= "generate" and params.takeId ~= 0 then
+    if before.trackedCount ~= before.takeCount then error("RETAKE_LIST_CHANGED: tracked IDs cannot be safely verified") end
+    local found = false
+    for _, id in ipairs(before.trackedTakeIds) do if id == params.takeId then found = true end end
+    if not found then error("UNTRACKED_RETAKE: only IDs generated by SV-MCP can be edited") end
+  end
+  local result = {success = true, dry_run = params.dry_run ~= false, before = before, requested = params}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok, err = pcall(function()
+    local ids = before.trackedTakeIds
+    if params.operation == "generate" then
+      -- Discard stale tracked IDs rather than guessing their validity.
+      if before.trackedCount ~= before.takeCount then ids = {} end
+      local id = retakes:generateTake(params.newDuration, params.newPitch, params.newTimbre)
+      ids[#ids + 1] = id
+      result.generatedTakeId = id
+    elseif params.operation == "activate" then retakes:setActiveTake(params.takeId)
+    elseif params.operation == "delete" then
+      retakes:deleteTake(params.takeId)
+      local kept = {}
+      for _, id in ipairs(ids) do if id ~= params.takeId then kept[#kept + 1] = id end end
+      ids = kept
+    end
+    retakes:setScriptData(RETAKE_KEY, {ids = ids, count = retakes:getNumTakes()})
+  end)
+  if not ok then error("RETAKE_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after = read_retake_state(project, ref, group, params.noteIndex)
+  return result
+end
+
+local function read_project_structure(project)
+  local tracks, groups, signature = {}, {}, {project:getFileName() or ""}
+  for t = 1, project:getNumTracks() do
+    local track = project:getTrack(t)
+    local item = {index = t - 1, name = track:getName(), numGroups = track:getNumGroups(), groups = {}}
+    signature[#signature + 1] = json.stringify({item.index, item.name, item.numGroups})
+    for i = 1, track:getNumGroups() do
+      local ref = track:getGroupReference(i)
+      local target = ref:getTarget()
+      local g = {index = i - 1, uuid = target and target:getUUID() or "", isMain = ref:isMain(), timeOffset = ref:getTimeOffset(), pitchOffset = ref:getPitchOffset(), muted = ref:isMuted(), noteCount = target and target:getNumNotes() or 0}
+      item.groups[#item.groups + 1] = g
+      signature[#signature + 1] = json.stringify({g.index,g.uuid,g.isMain,g.timeOffset,g.pitchOffset,g.muted,g.noteCount})
+      if target then
+        for n = 1, target:getNumNotes() do
+          local note = target:getNote(n)
+          signature[#signature + 1] = json.stringify({note:getOnset(), note:getDuration(), note:getPitch(), note:getLyrics() or "", note:getPhonemes() or ""})
+        end
+      end
+    end
+    tracks[#tracks + 1] = item
+  end
+  for i = 1, project:getNumNoteGroupsInLibrary() do
+    local group = project:getNoteGroup(i)
+    local g = {index = i - 1, uuid = group:getUUID(), name = group:getName(), noteCount = group:getNumNotes()}
+    groups[#groups + 1] = g
+    signature[#signature + 1] = json.stringify({g.uuid, g.name, g.noteCount})
+  end
+  return {trackCount = #tracks, tracks = tracks, libraryGroupCount = #groups, libraryGroups = groups, snapshot = table.concat(signature,"|"), snapshotScope = "project path, track and group references, note timing/pitch/lyrics/phonemes and library group names/counts"}
+end
+handlers.get_project_structure = function(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  return read_project_structure(project)
+end
+handlers.edit_project_structure = function(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  local before = read_project_structure(project)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_STRUCTURE_SNAPSHOT: re-read project structure") end
+  local track, group, libraryIndex
+  if params.trackIndex ~= nil then
+    if params.trackIndex < 0 or params.trackIndex >= project:getNumTracks() then error("Track index out of range") end
+    track = project:getTrack(params.trackIndex + 1)
+  end
+  if params.operation == "delete_track" and project:getNumTracks() <= 1 then error("Cannot delete last track") end
+  if params.operation == "delete_reference" then
+    if not track or not params.groupIndex or params.groupIndex < 1 or params.groupIndex >= track:getNumGroups() then error("Non-main group index out of range") end
+  elseif params.operation == "add_reference" or params.operation == "delete_group" then
+    for i = 1, project:getNumNoteGroupsInLibrary() do
+      local candidate = project:getNoteGroup(i)
+      if candidate:getUUID() == params.groupUUID then group = candidate; libraryIndex=i; break end
+    end
+    if not group then error("Group UUID not found in library") end
+    if params.operation == "delete_group" then
+      for _,t in ipairs(before.tracks) do for _,g in ipairs(t.groups) do
+        if g.uuid == params.groupUUID then error("REFERENCED_GROUP: delete group references before deleting library group") end
+      end end
+    end
+  end
+  local result = {success = true, dry_run = params.dry_run ~= false, before = before, requested = params}
+  if params.dry_run ~= false then return result end
+  local created
+  if params.operation == "add_track" then created = SV:create("Track"); created:setName(params.name)
+  elseif params.operation == "add_group" then created = SV:create("NoteGroup"); created:setName(params.name)
+  elseif params.operation == "add_reference" then created = SV:create("NoteGroupReference"); created:setTarget(group); created:setTimeOffset(params.timeOffset) end
+  project:newUndoRecord()
+  local ok, err = pcall(function()
+    if params.operation == "add_track" then project:addTrack(created)
+    elseif params.operation == "delete_track" then project:removeTrack(params.trackIndex + 1)
+    elseif params.operation == "add_group" then project:addNoteGroup(created)
+    elseif params.operation == "delete_group" then project:removeNoteGroup(libraryIndex)
+    elseif params.operation == "add_reference" then track:addGroupReference(created)
+    elseif params.operation == "delete_reference" then track:removeGroupReference(params.groupIndex + 1) end
+  end)
+  if not ok then error("STRUCTURE_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after = read_project_structure(project)
+  return result
+end
+
+local function read_time_axis(project)
+  local axis = project:getTimeAxis()
+  local tempo, meter = axis:getAllTempoMarks() or {}, axis:getAllMeasureMarks() or {}
+  local signature = {project:getFileName() or ""}
+  for _, v in ipairs(tempo) do signature[#signature + 1] = json.stringify({v.position,v.bpm}) end
+  for _, v in ipairs(meter) do signature[#signature + 1] = json.stringify({v.position,v.numerator,v.denominator}) end
+  return {tempo = tempo, meter = meter, tempoCount = #tempo, meterCount = #meter, snapshot = table.concat(signature,"|")}
+end
+handlers.get_time_axis = function(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  return read_time_axis(project)
+end
+handlers.edit_time_axis = function(params)
+  local project = SV:getProject()
+  if not project then error("No active project") end
+  local before = read_time_axis(project)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_TIME_AXIS_SNAPSHOT: re-read time axis") end
+  local result = {success = true, dry_run = params.dry_run ~= false, before = before, requested = params}
+  if params.dry_run ~= false then return result end
+  local axis = project:getTimeAxis()
+  project:newUndoRecord()
+  local ok, err = pcall(function()
+    if params.operation == "set_tempo" then axis:addTempoMark(params.position, params.bpm)
+    elseif params.operation == "delete_tempo" then result.removed = axis:removeTempoMark(params.position)
+    elseif params.operation == "set_meter" then axis:addMeasureMark(params.position, params.numerator, params.denominator)
+    elseif params.operation == "delete_meter" then result.removed = axis:removeMeasureMark(params.position) end
+  end)
+  if not ok then error("TIME_AXIS_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after = read_time_axis(project)
+  local found = nil
+  local marks = (params.operation == "set_tempo" or params.operation == "delete_tempo") and result.after.tempo or result.after.meter
+  for _, mark in ipairs(marks) do if mark.position == params.position then found = mark end end
+  if params.operation == "set_tempo" and (not found or math.abs(found.bpm - params.bpm) > 0.001) then error("HOST_POSTCONDITION_FAILED: tempo mismatch; use SynthV Undo") end
+  if params.operation == "set_meter" and (not found or found.numerator ~= params.numerator or found.denominator ~= params.denominator) then error("HOST_POSTCONDITION_FAILED: meter mismatch; use SynthV Undo") end
+  if (params.operation == "delete_tempo" or params.operation == "delete_meter") and found then error("HOST_POSTCONDITION_FAILED: mark remains; use SynthV Undo") end
+  return result
+end
+
+handlers.get_editor_view = function(params)
+  local nav = SV:getMainEditor():getNavigation()
+  return {timeRange = nav:getTimeViewRange(), pitchRange = nav:getValueViewRange(), timeScale = nav:getTimePxPerUnit(), pitchScale = nav:getValuePxPerUnit()}
+end
+handlers.set_editor_view = function(params)
+  local before = handlers.get_editor_view({})
+  local result = {success = true, dry_run = params.dry_run ~= false, before = before, requested = params}
+  if params.dry_run ~= false then return result end
+  local nav = SV:getMainEditor():getNavigation()
+  if params.scale ~= nil then nav:setTimeScale(params.scale) end
+  if params.left ~= nil then nav:setTimeLeft(params.left) end
+  if params.right ~= nil then nav:setTimeRight(params.right) end
+  if params.centerPitch ~= nil then nav:setValueCenter(params.centerPitch) end
+  result.after = handlers.get_editor_view({})
+  return result
+end
+handlers.set_note_selection = function(params)
+  local editor = SV:getMainEditor()
+  local ref = editor:getCurrentGroup()
+  local group = ref:getTarget()
+  if group:getUUID() ~= params.expectedGroupUUID then error("STALE_EDITOR_GROUP: current group changed") end
+  local selected = {}
+  for _, index in ipairs(params.noteIndices or {}) do
+    if index < 0 or index >= group:getNumNotes() then error("Note index out of range: " .. tostring(index)) end
+    selected[#selected + 1] = group:getNote(index + 1)
+  end
+  local result = {success = true, dry_run = params.dry_run ~= false, noteCount = #selected, mode = params.mode}
+  if params.dry_run ~= false then return result end
+  local selection = editor:getSelection()
+  if params.mode == "clear" or params.mode == "replace" then selection:clearNotes() end
+  if params.mode ~= "clear" then
+    for _, note in ipairs(selected) do
+      if params.mode == "remove" then selection:unselectNote(note) else selection:selectNote(note) end
+    end
+  end
+  result.after = handlers.get_editor_context({})
+  return result
+end
+handlers.convert_pitch = function(params)
+  -- SynthV 2.2.1 may not expose these documented helpers in Lua.
+  local midi = params.unit == "hz" and (69 + 12 * math.log(params.value / 440) / math.log(2)) or params.value
+  return {midi = midi, hz = 440 * 2 ^ ((midi - 69) / 12)}
+end
+
+handlers.get_phrase_context = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  local notes, matching = {}, 0
+  for i = 1, group:getNumNotes() do
+    local note = group:getNote(i)
+    if note:getOnset() < params["end"] and note:getOnset() + note:getDuration() > params.start then
+      matching = matching + 1
+      if #notes < (params.limit or 64) then
+        local item = {index = i - 1, onset = note:getOnset(), duration = note:getDuration(), pitch = note:getPitch(),
+          absolutePitch = note:getPitch() + ref:getPitchOffset(), lyrics = note:getLyrics(), phonemes = note:getPhonemes()}
+        if params.includePitch then
+          local interval = math.max(1, math.floor(note:getDuration() / 20))
+          local samples = SV:getComputedPitchForGroup(ref, note:getOnset() + ref:getTimeOffset(), interval, 4)
+          item.onsetPitch = {interval = interval, values = samples or {}, count = samples and #samples or 0,
+            units = "MIDI semitones", samplePosition = "note onset, then 5%, 10%, 15% of duration"}
+        end
+        notes[#notes + 1] = item
+      end
+    end
+  end
+  return {groupUUID = group:getUUID(), timeOffset = ref:getTimeOffset(), pitchOffset = ref:getPitchOffset(),
+    start = params.start, ["end"] = params["end"], positionUnits = "group-local blicks", notes = notes,
+    returnedCount = #notes, matchingCount = matching, truncated = matching > #notes}
+end
+
+handlers.transform_notes = function(params)
+  local project, track, ref, group = resolve_target_group(params)
+  local state = read_pitch_state(project, ref, group)
+  if state.snapshot ~= params.expectedSnapshot then error("STALE_GROUP_SNAPSHOT: re-read pitch controls") end
+  if state.referenceCount > 1 and not params.allowSharedGroup then error("SHARED_GROUP: all linked references would change") end
+  local changes, objects = {}, {}
+  for _, index in ipairs(params.noteIndices) do
+    if index < 0 or index >= group:getNumNotes() then error("Note index out of range") end
+    local note = group:getNote(index + 1)
+    local onset = note:getOnset() + params.onsetOffset
+    local duration = math.floor(note:getDuration() * params.durationScale + 0.5)
+    local pitch = note:getPitch() + params.pitchOffset
+    if onset < 0 or duration < 1 or pitch < 0 or pitch > 127 then error("Transform would produce an invalid note") end
+    objects[#objects + 1] = note
+    changes[#changes + 1] = {index = index, before = {onset=note:getOnset(), duration=note:getDuration(), pitch=note:getPitch()}, after={onset=onset,duration=duration,pitch=pitch}}
+  end
+  local result = {success=true,dry_run=params.dry_run ~= false,groupUUID=group:getUUID(),referenceCount=state.referenceCount,changes=changes}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function()
+    for i,note in ipairs(objects) do
+      local after=changes[i].after
+      if params.pitchOffset ~= 0 then note:setPitch(after.pitch) end
+      if params.durationScale ~= 1 then note:setDuration(after.duration) end
+      if params.onsetOffset ~= 0 then note:setOnset(after.onset) end
+    end
+  end)
+  if not ok then error("NOTE_TRANSFORM_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  for i,note in ipairs(objects) do
+    local after=changes[i].after
+    if note:getOnset() ~= after.onset or note:getDuration() ~= after.duration or note:getPitch() ~= after.pitch then
+      error("HOST_POSTCONDITION_FAILED: transformed notes differ; use SynthV Undo")
+    end
+  end
+  result.verified = true
+  return result
+end
+
+handlers.get_host_info = function(params)
+  return SV:getHostInfo()
+end
+handlers.get_selection_details = function(params)
+  local editor = SV:getMainEditor()
+  local selection = editor:getSelection()
+  local notes, groups, controls = {}, {}, {}
+  for _, n in ipairs(selection:getSelectedNotes() or {}) do notes[#notes+1] = n:getIndexInParent()-1 end
+  for _, g in ipairs(selection:getSelectedGroups() or {}) do groups[#groups+1] = {index=g:getIndexInParent()-1,uuid=g:getTarget():getUUID()} end
+  for _, c in ipairs(selection:getSelectedPitchControls() or {}) do controls[#controls+1] = c:getIndexInParent()-1 end
+  local points = params.paramName and selection:getSelectedPoints(params.paramName) or {}
+  return {currentGroupUUID=editor:getCurrentGroup():getTarget():getUUID(), notes=notes, noteCount=#notes, groups=groups, groupCount=#groups, pitchControls=controls, pitchControlCount=#controls, parameter=params.paramName, points=points, pointCount=#points}
+end
+handlers.set_editor_objects = function(params)
+  local editor=SV:getMainEditor()
+  local ref=editor:getCurrentGroup()
+  local group=ref:getTarget()
+  if group:getUUID() ~= params.expectedGroupUUID then error("STALE_EDITOR_GROUP: current group changed") end
+  local target=params.kind == "group" and editor:getCurrentTrack() or group
+  local count=params.kind == "group" and target:getNumGroups() or target:getNumPitchControls()
+  local objects={}
+  for _,index in ipairs(params.indices or {}) do
+    if index < 0 or index >= count then error("Selection index out of range") end
+    objects[#objects+1] = params.kind == "group" and target:getGroupReference(index+1) or target:getPitchControl(index+1)
+  end
+  local result={success=true,dry_run=params.dry_run ~= false,kind=params.kind,mode=params.mode,count=#objects}
+  if params.dry_run ~= false then return result end
+  local selection=editor:getSelection()
+  if params.mode == "replace" or params.mode == "clear" then
+    if params.kind == "group" then selection:clearGroups() else selection:clearPitchControls() end
+  end
+  if params.mode ~= "clear" then
+    if params.kind == "group" then
+      for _,obj in ipairs(objects) do if params.mode == "remove" then selection:unselectGroup(obj) else selection:selectGroup(obj) end end
+    elseif params.mode == "remove" then selection:unselectPitchControls(objects)
+    else selection:selectPitchControls(objects) end
+  end
+  result.after=handlers.get_selection_details({})
+  return result
+end
+handlers.convert_editor_coordinates = function(params)
+  local nav=SV:getMainEditor():getNavigation()
+  local v=params.value
+  if params.direction == "time_to_x" then v=nav:t2x(v)
+  elseif params.direction == "x_to_time" then v=nav:x2t(v)
+  elseif params.direction == "pitch_to_y" then v=nav:v2y(v)
+  elseif params.direction == "y_to_pitch" then v=nav:y2v(v)
+  elseif params.direction == "snap_time" then v=nav:snap(v) end
+  return {direction=params.direction,input=params.value,value=v}
+end
+
+local function read_automation_state(project, ref, group, name)
+  local parameter=group:getParameter(name)
+  if not parameter then error("Parameter not found: " .. name) end
+  local points=parameter:getAllPoints() or {}
+  local definition=parameter:getDefinition()
+  if not definition or not definition.range or #definition.range ~= 2 then error("Parameter definition unavailable") end
+  local base=read_pitch_state(project,ref,group)
+  local signature={base.snapshot,name,parameter:getInterpolationMethod() or "",definition.range[1],definition.range[2]}
+  for _,p in ipairs(points) do signature[#signature+1]=json.stringify({p[1],p[2]}) end
+  return {groupUUID=group:getUUID(),referenceCount=base.referenceCount,paramName=name,definition=definition,interpolation=parameter:getInterpolationMethod(),points=points,pointCount=#points,snapshot=json.stringify(signature)},parameter
+end
+handlers.get_automation_state = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  return read_automation_state(project,ref,group,params.paramName)
+end
+handlers.edit_automation = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  local before,parameter=read_automation_state(project,ref,group,params.paramName)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_AUTOMATION: re-read parameter") end
+  if before.referenceCount > 1 and not params.allowSharedGroup then error("SHARED_GROUP: all linked references would change") end
+  for _,p in ipairs(params.points or {}) do
+    if p[2] < before.definition.range[1] or p[2] > before.definition.range[2] then error("Parameter value outside host range") end
+  end
+  local result={success=true,dry_run=params.dry_run ~= false,before=before,requested=params}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function()
+    if params.mode == "remove_range" or params.mode == "replace_range" then parameter:remove(params.start,params["end"]) end
+    if params.mode == "simplify" then parameter:simplify(params.start,params["end"],params.threshold or 0.002) end
+    if params.mode == "add" or params.mode == "replace_range" then
+      for _,p in ipairs(params.points or {}) do parameter:add(p[1],p[2]) end
+    end
+  end)
+  if not ok then error("AUTOMATION_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after=read_automation_state(project,ref,group,params.paramName)
+  local afterByPosition={}
+  for _,p in ipairs(result.after.points) do afterByPosition[p[1]]=p[2] end
+  if params.mode ~= "add" then
+    for _,p in ipairs(before.points) do
+      if (p[1] < params.start or p[1] > params["end"]) and afterByPosition[p[1]] ~= p[2] then
+        error("HOST_POSTCONDITION_FAILED: automation outside range changed; use SynthV Undo")
+      end
+    end
+  end
+  if params.mode == "remove_range" or params.mode == "replace_range" then
+    local expected={}
+    for _,p in ipairs(params.points or {}) do expected[p[1]]=p[2] end
+    for _,p in ipairs(result.after.points) do
+      if p[1] >= params.start and p[1] <= params["end"] and (params.mode == "remove_range" or expected[p[1]] == nil) then
+        error("HOST_POSTCONDITION_FAILED: unexpected point in range; use SynthV Undo")
+      end
+    end
+  end
+  if params.mode == "add" or params.mode == "replace_range" then
+    for _,p in ipairs(params.points or {}) do
+      local actual=parameter:get(p[1])
+      if not actual or math.abs(actual-p[2]) > 0.0001 then error("HOST_POSTCONDITION_FAILED: automation point mismatch; use SynthV Undo") end
+    end
+  end
+  result.verified=true
+  return result
+end
+
+local function read_voice_snapshot(project,ref,group)
+  local voice=ref:getVoice() or {}
+  local parts={project:getFileName() or "",group:getUUID(),tostring(ref:getTimeOffset()),tostring(ref:getPitchOffset())}
+  for _,key in ipairs({"paramLoudness","paramTension","paramBreathiness","paramGender","paramToneShift"}) do
+    parts[#parts+1]=json.stringify({key,voice[key] == nil and "absent" or voice[key]})
+  end
+  local modes={}
+  for name,_ in pairs(voice.vocalModeParams or {}) do modes[#modes+1]=name end
+  table.sort(modes)
+  for _,name in ipairs(modes) do
+    local mode=voice.vocalModeParams[name]
+    parts[#parts+1]=json.stringify({name,mode.pitch or "absent",mode.timbre or "absent",mode.pronunciation or "absent"})
+  end
+  return {voice=voice,groupUUID=group:getUUID(),snapshot=table.concat(parts,"|"),singerIdentityAvailable=false}
+end
+handlers.get_voice_snapshot = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  return read_voice_snapshot(project,ref,group)
+end
+handlers.copy_voice_settings = function(params)
+  local project,st,sref,sg=resolve_target_group({trackIndex=params.sourceTrack,groupIndex=params.sourceGroup})
+  local _,tt,tref,tg=resolve_target_group({trackIndex=params.targetTrack,groupIndex=params.targetGroup})
+  local source=read_voice_snapshot(project,sref,sg)
+  local target=read_voice_snapshot(project,tref,tg)
+  if source.snapshot ~= params.expectedSource or target.snapshot ~= params.expectedTarget then error("STALE_VOICE_SNAPSHOT: re-read source and target") end
+  local copied={}
+  for _,key in ipairs({"paramLoudness","paramTension","paramBreathiness","paramGender","paramToneShift","vocalModeParams"}) do
+    if source.voice[key] ~= nil then copied[key]=source.voice[key] end
+  end
+  if not next(copied) then error("Source voice has no explicit values to copy") end
+  local result={success=true,dry_run=params.dry_run ~= false,source=source,target=target,requested=copied,singerCopied=false}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function() tref:setVoice(copied) end)
+  if not ok then error("VOICE_COPY_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after=read_voice_snapshot(project,tref,tg)
+  return result
+end
+
+handlers.humanize_notes = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  local state=read_pitch_state(project,ref,group)
+  if state.snapshot ~= params.expectedSnapshot then error("STALE_GROUP_SNAPSHOT: re-read pitch controls") end
+  if state.referenceCount > 1 and not params.allowSharedGroup then error("SHARED_GROUP: all linked references would change") end
+  local seed=params.seed
+  local function jitter(maximum)
+    seed=(seed*48271)%2147483647
+    if maximum == 0 then return 0 end
+    return math.floor((seed/2147483647)*(2*maximum+1))-maximum
+  end
+  local changes,objects,onsets={},{},{}
+  for _,index in ipairs(params.noteIndices) do
+    if index < 0 or index >= group:getNumNotes() then error("Note index out of range") end
+    local note=group:getNote(index+1)
+    local old=note:getOnset()
+    local offset
+    if params.preserveChords and onsets[old] ~= nil then offset=onsets[old]
+    else offset=jitter(params.onsetJitter); if params.preserveChords then onsets[old]=offset end end
+    local onset=old+offset
+    local duration=note:getDuration()+jitter(params.durationJitter)
+    if onset < 0 or duration < 1 then error("Humanization would produce invalid timing") end
+    objects[#objects+1]=note
+    changes[#changes+1]={index=index,before={onset=old,duration=note:getDuration()},after={onset=onset,duration=duration}}
+  end
+  local result={success=true,dry_run=params.dry_run ~= false,seed=params.seed,changes=changes}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function()
+    for i,note in ipairs(objects) do note:setDuration(changes[i].after.duration);note:setOnset(changes[i].after.onset) end
+  end)
+  if not ok then error("HUMANIZE_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  for i,note in ipairs(objects) do if note:getOnset() ~= changes[i].after.onset or note:getDuration() ~= changes[i].after.duration then error("HOST_POSTCONDITION_FAILED: humanization mismatch; use SynthV Undo") end end
+  result.verified=true
+  return result
+end
+
+handlers.fit_lyrics = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  local state=read_pitch_state(project,ref,group)
+  if state.snapshot ~= params.expectedSnapshot then error("STALE_GROUP_SNAPSHOT: re-read pitch controls") end
+  if state.referenceCount > 1 and not params.allowSharedGroup then error("SHARED_GROUP: all linked references would change") end
+  local changes,objects={},{}
+  for _,assignment in ipairs(params.assignments) do
+    if assignment.noteIndex < 0 or assignment.noteIndex >= group:getNumNotes() then error("Note index out of range") end
+    if assignment.phonemes and assignment.phonemes:sub(1,1) == "." then error("Formal phonemes must not begin with a dot") end
+    local note=group:getNote(assignment.noteIndex+1)
+    objects[#objects+1]=note
+    changes[#changes+1]={index=assignment.noteIndex,before={lyrics=note:getLyrics(),phonemes=note:getPhonemes()},after={lyrics=assignment.lyrics,phonemes=assignment.phonemes}}
+  end
+  local result={success=true,dry_run=params.dry_run ~= false,changes=changes}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function()
+    for i,note in ipairs(objects) do
+      local after=changes[i].after
+      note:setLyrics(after.lyrics)
+      if after.phonemes ~= nil then note:setPhonemes(after.phonemes) end
+    end
+  end)
+  if not ok then error("LYRIC_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  for i,note in ipairs(objects) do
+    local after=changes[i].after
+    if note:getLyrics() ~= after.lyrics or (after.phonemes ~= nil and note:getPhonemes() ~= after.phonemes) then error("HOST_POSTCONDITION_FAILED: lyric mismatch; use SynthV Undo") end
+  end
+  result.verified=true
+  return result
+end
+
+handlers.host_clipboard = function(params)
+  if params.operation == "read" then return {text=SV:getHostClipboard()} end
+  if params.dry_run ~= false then return {success=true,dry_run=true,requested=params.text} end
+  SV:setHostClipboard(params.text)
+  local observed=SV:getHostClipboard()
+  if observed ~= params.text then error("HOST_POSTCONDITION_FAILED: clipboard mismatch") end
+  return {success=true,dry_run=false,verified=true}
+end
+
+handlers.edit_voice_settings = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  local before=read_voice_snapshot(project,ref,group)
+  if before.snapshot ~= params.expectedSnapshot then error("STALE_VOICE_SNAPSHOT: re-read voice") end
+  local result={success=true,dry_run=params.dry_run ~= false,before=before,requested=params.voice,singerIdentityAvailable=false}
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function() ref:setVoice(params.voice) end)
+  if not ok then error("VOICE_EDIT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  result.after=read_voice_snapshot(project,ref,group)
+  for key,value in pairs(params.voice) do
+    if key ~= "vocalModeParams" and result.after.voice[key] ~= value then error("HOST_POSTCONDITION_FAILED: voice value mismatch; use SynthV Undo") end
+    if key == "vocalModeParams" then
+      for modeName,axes in pairs(value) do
+        local observed=(result.after.voice.vocalModeParams or {})[modeName] or {}
+        for axis,amount in pairs(axes) do if observed[axis] ~= amount then error("HOST_POSTCONDITION_FAILED: vocal mode mismatch; use SynthV Undo") end end
+      end
+    end
+  end
+  result.verified=true
+  return result
+end
+
+handlers.import_score_notes = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  local state=read_pitch_state(project,ref,group)
+  if state.snapshot ~= params.expectedSnapshot then error("STALE_GROUP_SNAPSHOT: re-read target") end
+  if state.referenceCount>1 and not params.allowSharedGroup then error("SHARED_GROUP: imported notes affect all references") end
+  local notes=params.notes or {}
+  if #notes<1 or #notes>60 then error("Import must contain 1 to 60 notes") end
+  local detached={}
+  for _,n in ipairs(notes) do
+    for i=1,group:getNumNotes() do
+      local existing=group:getNote(i)
+      if existing:getOnset()<n.onset+n.duration and n.onset<existing:getOnset()+existing:getDuration() then error("TARGET_OVERLAP: imported notes overlap existing notes") end
+    end
+    local note=SV:create("Note")
+    note:setOnset(n.onset);note:setDuration(n.duration);note:setPitch(n.pitch);note:setLyrics(n.lyrics)
+    detached[#detached+1]=note
+  end
+  local result={success=true,dry_run=params.dry_run ~= false,notes=notes,importedCount=#notes,groupUUID=group:getUUID()}
+  if params.dry_run ~= false then return result end
+  local oldCount=group:getNumNotes()
+  project:newUndoRecord()
+  local ok,err=pcall(function() for _,note in ipairs(detached) do group:addNote(note) end end)
+  if not ok then error("IMPORT_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  if group:getNumNotes() ~= oldCount+#notes then error("HOST_POSTCONDITION_FAILED: note count mismatch; use SynthV Undo") end
+  for i,note in ipairs(detached) do
+    local n=notes[i]
+    if note:getOnset()~=n.onset or note:getDuration()~=n.duration or note:getPitch()~=n.pitch or note:getLyrics()~=n.lyrics then error("HOST_POSTCONDITION_FAILED: note mismatch; use SynthV Undo") end
+  end
+  result.verified=true
+  return result
+end
+
+handlers.script_data = function(params)
+  local project,track,ref,group=resolve_target_group(params)
+  local obj=params.object == "project" and project or params.object == "track" and track or params.object == "group_reference" and ref or group
+  local identity=group:getUUID()
+  if params.object == "note" then
+    if params.noteIndex < 0 or params.noteIndex >= group:getNumNotes() then error("Note index out of range") end
+    obj=group:getNote(params.noteIndex+1)
+    identity=identity .. ":" .. tostring(params.noteIndex) .. ":" .. tostring(obj:getOnset()) .. ":" .. tostring(obj:getPitch())
+  end
+  local value=obj:getScriptData(params.key)
+  local present=obj:hasScriptData(params.key)
+  local snapshot=json.stringify({project:getFileName() or "",params.object,identity,params.key,present,json.stringify(value)})
+  local result={object=params.object,key=params.key,present=present,value=value,snapshot=snapshot}
+  if params.operation == "read" then return result end
+  if snapshot ~= params.expectedSnapshot then error("STALE_SCRIPT_DATA: re-read metadata") end
+  result.dry_run=params.dry_run ~= false
+  if params.dry_run ~= false then return result end
+  project:newUndoRecord()
+  local ok,err=pcall(function() if params.operation == "set" then obj:setScriptData(params.key,params.value) else obj:removeScriptData(params.key) end end)
+  if not ok then error("SCRIPT_DATA_FAILED: use SynthV Undo before retrying: " .. tostring(err)) end
+  local afterPresent=obj:hasScriptData(params.key)
+  local afterValue=obj:getScriptData(params.key)
+  if params.operation == "remove" and afterPresent then error("HOST_POSTCONDITION_FAILED: metadata remains; use SynthV Undo") end
+  if params.operation == "set" and (not afterPresent or json.stringify(afterValue) ~= json.stringify(params.value)) then error("HOST_POSTCONDITION_FAILED: metadata mismatch; use SynthV Undo") end
+  result.success=true;result.presentAfter=afterPresent;result.valueAfter=afterValue
+  return result
+end
+
+local dialogSequence, dialogResults, pendingDialog = 0, {}, false
+handlers.show_dialog = function(params)
+  if params.dry_run ~= false then return {success=true,dry_run=true,kind=params.kind,title=params.title,message=params.message} end
+  if pendingDialog then error("DIALOG_BUSY: an earlier dialog is still open") end
+  dialogSequence=dialogSequence+1
+  local id=dialogSequence
+  dialogResults[id]={status="pending"}
+  pendingDialog=true
+  -- Keep the cache bounded; completed results are session-local.
+  if id>100 then dialogResults[id-100]=nil end
+  local function finish(value)
+    dialogResults[id]={status="complete",value=value}
+    pendingDialog=false
+  end
+  local ok,err=pcall(function()
+    if params.kind=="message" then SV:showMessageBoxAsync(params.title,params.message,function() finish(true) end)
+    elseif params.kind=="input" then SV:showInputBoxAsync(params.title,params.message,params.defaultText or "",finish)
+    elseif params.kind=="ok_cancel" then SV:showOkCancelBoxAsync(params.title,params.message,finish)
+    else SV:showYesNoCancelBoxAsync(params.title,params.message,finish) end
+  end)
+  if not ok then pendingDialog=false;dialogResults[id]=nil;error("DIALOG_FAILED: " .. tostring(err)) end
+  return {success=true,dry_run=false,dialogId=id,status="pending"}
+end
+handlers.get_dialog_result = function(params)
+  local value=dialogResults[params.dialogId]
+  if not value then error("DIALOG_NOT_FOUND: results are local to this handler session") end
+  return {dialogId=params.dialogId,status=value.status,value=value.value}
+end
+
+handlers.set_automation_selection = function(params)
+  local editor=SV:getMainEditor()
+  if editor:getCurrentGroup():getTarget():getUUID() ~= params.expectedGroupUUID then error("STALE_EDITOR_GROUP: current group changed") end
+  local selection=editor:getSelection()
+  local current=selection:getSelectedPoints(params.paramName) or {}
+  local result={success=true,dry_run=params.dry_run ~= false,before=current,requested=params.positions,mode=params.mode}
+  if params.dry_run ~= false then return result end
+  if params.mode=="replace" or params.mode=="clear" then selection:unselectPoints(params.paramName,current) end
+  if params.mode=="remove" then selection:unselectPoints(params.paramName,params.positions)
+  elseif params.mode=="add" or params.mode=="replace" then selection:selectPoints(params.paramName,params.positions) end
+  result.after=selection:getSelectedPoints(params.paramName) or {}
+  return result
+end
+
 handlers.get_note_attributes = function(params)
   local project, track, groupRef, targetGroup = resolve_target_group(params)
   local idx1 = (params.noteIndex or 0) + 1
@@ -1071,7 +1898,7 @@ handlers.batch_edit = function(params)
 
     local ok, res = pcall(handler, opParams)
     if not ok then
-      error("Batch operation failed at step " .. (opIndex - 1) .. " (" .. tostring(action) .. "): " .. tostring(res))
+      error("Batch operation failed at step " .. (opIndex - 1) .. " (" .. tostring(action) .. "); earlier operations may have changed the project. Use SynthV Undo as needed: " .. tostring(res))
     end
     table.insert(results, { action = action, result = res })
   end
